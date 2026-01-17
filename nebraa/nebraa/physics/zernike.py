@@ -29,20 +29,60 @@ def noll_to_nm(j: int) -> Tuple[int, int]:
     """
     Convert Noll index to (n, m) Zernike indices.
     
+    Uses the standard Noll (1976) indexing convention where within each
+    radial order n, modes are ordered by increasing |m|, with the sine 
+    term (m<0) before the cosine term (m>0):
+    
+    j=1:  (0,0)  piston
+    j=2:  (1,1)  x-tilt
+    j=3:  (1,-1) y-tilt
+    j=4:  (2,0)  defocus
+    j=5:  (2,-2) oblique astigmatism
+    j=6:  (2,2)  vertical astigmatism
+    j=7:  (3,-1) vertical coma
+    j=8:  (3,1)  horizontal coma
+    j=9:  (3,-3) oblique trefoil
+    j=10: (3,3)  vertical trefoil
+    ...
+    
     Args:
-        j: Noll index (1-based)
+        j: Noll index (1-based, j >= 1)
     
     Returns:
         (n, m) tuple: radial order n, azimuthal frequency m
     """
-    n = int(math.ceil((-3 + math.sqrt(9 + 8*(j-1))) / 2))
-    m = 2*j - n*(n+2) - 1
+    if j < 1:
+        raise ValueError(f"Noll index must be >= 1, got {j}")
     
-    # Adjust sign based on parity
-    if j % 2 == 0:
-        m = abs(m)
-    else:
-        m = -abs(m) if m != 0 else 0
+    # Find radial order n such that n*(n+1)/2 < j <= (n+1)*(n+2)/2
+    n = 0
+    while (n + 1) * (n + 2) // 2 < j:
+        n += 1
+    
+    # Position within this radial order (0-based)
+    k = j - n * (n + 1) // 2 - 1
+    
+    # Noll ordering within radial order n:
+    # - First: m=0 (if n is even) or lowest |m| pair
+    # - Then pairs of increasing |m|: (m<0, m>0)
+    # 
+    # For even n: modes are 0, -2, 2, -4, 4, ... or similar
+    # For odd n: modes are -1, 1, -3, 3, ...
+    #
+    # The pattern is: within order n, for position k (0-based):
+    # |m| = 2*((k+1)//2) if n is even, else |m| = 2*((k)//2) + 1
+    
+    if n % 2 == 0:  # Even n: has m=0 term
+        if k == 0:
+            m = 0
+        else:
+            m_abs = 2 * ((k + 1) // 2)
+            # Odd k -> negative m, even k -> positive m (for k > 0)
+            m = -m_abs if k % 2 == 1 else m_abs
+    else:  # Odd n: no m=0 term
+        m_abs = 2 * (k // 2) + 1
+        # Even k -> negative m, odd k -> positive m
+        m = -m_abs if k % 2 == 0 else m_abs
     
     return n, m
 
@@ -52,20 +92,37 @@ def nm_to_noll(n: int, m: int) -> int:
     Convert (n, m) Zernike indices to Noll index.
     
     Args:
-        n: Radial order
-        m: Azimuthal frequency
+        n: Radial order (n >= 0)
+        m: Azimuthal frequency (|m| <= n, n-|m| must be even)
     
     Returns:
         Noll index (1-based)
     """
-    j = n * (n + 1) // 2 + 1
+    if n < 0:
+        raise ValueError(f"Radial order n must be >= 0, got {n}")
+    if abs(m) > n:
+        raise ValueError(f"|m|={abs(m)} must be <= n={n}")
+    if (n - abs(m)) % 2 != 0:
+        raise ValueError(f"n-|m| must be even: n={n}, m={m}")
     
-    if m > 0:
-        j += 2 * ((n % 2 == 0) ^ (m % 2 == 0))
-    elif m < 0:
-        j += 2 * ((n % 2 == 0) ^ (abs(m) % 2 == 1)) + 1
+    # Base index: first mode of radial order n
+    j_base = n * (n + 1) // 2 + 1
     
-    return j
+    # Find position k within radial order
+    if n % 2 == 0:  # Even n
+        if m == 0:
+            k = 0
+        elif m < 0:
+            k = abs(m) - 1  # -2 -> k=1, -4 -> k=3
+        else:
+            k = m  # 2 -> k=2, 4 -> k=4
+    else:  # Odd n
+        if m < 0:
+            k = abs(m) - 1  # -1 -> k=0, -3 -> k=2
+        else:
+            k = m  # 1 -> k=1, 3 -> k=3
+    
+    return j_base + k
 
 
 def count_modes(n_min: int, n_max: int) -> int:

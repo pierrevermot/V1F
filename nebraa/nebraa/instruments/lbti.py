@@ -14,9 +14,9 @@ from dataclasses import dataclass
 from . import Instrument, register_instrument
 from ..config import InstrumentConfig
 from ..utils.compute import get_backend
-from ..physics.zernike import ZernikeGenerator
+from ..physics.zernike import build_zernike_modes, generate_zernike_phase
 from ..physics.kolmogorov import KolmogorovGenerator
-from ..physics.optics import compute_psf, compute_psf_from_phase
+from ..physics.optics import compute_psf
 from ..physics.noise import simulate_observation
 
 
@@ -197,12 +197,16 @@ class LBTIInstrument(Instrument):
         """Get pupil amplitude array."""
         return self.generate_pupil()
     
-    def _get_zernike_gen(self) -> ZernikeGenerator:
-        """Get or create Zernike generator for individual aperture."""
+    def _get_zernike_modes(self):
+        """Get Zernike modes for individual aperture."""
         if self._zernike_gen is None:
             # Aperture size in the full array
             aperture_pix = int(self.n_pix * self.D / (self.baseline + self.D))
-            self._zernike_gen = ZernikeGenerator(aperture_pix, self.n_zernike)
+            self._zernike_gen = build_zernike_modes(
+                n_pix=aperture_pix, 
+                radius=1.0, 
+                n_range=(2, 5)
+            )
         return self._zernike_gen
     
     def generate_pupil(self) -> np.ndarray:
@@ -302,11 +306,8 @@ class LBTIInstrument(Instrument):
         if phase is None:
             phase = self.generate_phase()
         
-        # Create complex pupil field
-        pupil_field = pupil * xp.exp(1j * phase)
-        
-        # Compute PSF
-        psf = compute_psf(pupil_field, pad_factor=2, normalize=True)
+        # Compute PSF using optics module
+        psf = compute_psf(pupil, phase, normalize=True)
         
         return psf
     

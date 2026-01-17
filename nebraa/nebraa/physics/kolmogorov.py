@@ -169,8 +169,29 @@ class KolmogorovGenerator:
             self.freq_grid.F, self.fc, transition_frac, highpass=True
         )
         
-        # Kolmogorov constant
-        self.C = 0.023 * (2.0 * xp.pi) ** (-11.0 / 3.0)
+        # Kolmogorov constant for PSD in rad^2/(cy/m)^2
+        # W_phi(f) = C * r0^(-5/3) * f^(-11/3) with C = 0.023
+        self.C = 0.023
+        
+        # FFT normalization for phase screen generation:
+        # 
+        # NumPy's ifft2 includes a 1/N^2 factor: ifft2(X) = (1/N^2) * sum(X * exp)
+        # From Parseval: var(x) = (1/N^4) * E[sum|X|^2]
+        # 
+        # For complex Gaussian noise Z with E[|Z|^2] = 2 and spectrum X = A * Z:
+        #   E[|X|^2] = A^2 * 2
+        # 
+        # We want: var(phi) = sum(W_phi * df^2) where df = 1/(N*pixel_size)
+        # So: (1/N^4) * sum(A^2 * 2) = sum(W_phi * df^2)
+        # => A = sqrt(N^4 * W_phi * df^2 / 2)
+        #
+        # However, since we take only the real part of ifft2(X), we lose half the
+        # variance (the imaginary part). To compensate, we use:
+        #   A = sqrt(N^4 * W_phi * df^2)  (no division by 2)
+        #
+        # This is equivalent to: A = N^2 * sqrt(W_phi) * df = N * sqrt(W_phi) / pixel_size / N
+        #                         = sqrt(W_phi) / pixel_size * N
+        self.df = 1.0 / (n_pix * pixel_size)
         
         # Precomputed frequency term
         self.f_term = (self.freq_grid.F ** (-11.0 / 3.0)).astype(xp.float32)
@@ -205,17 +226,21 @@ class KolmogorovGenerator:
         noise_imag = xp.random.randn(n_screens, n_pix, n_pix).astype(xp.float32)
         W = (noise_real + 1j * noise_imag).astype(xp.complex64)
         
-        # PSD amplitude
+        # PSD amplitude with FFT normalization
+        # A = sqrt(N^4 * W_phi * df^2) where W_phi = C * r0^(-5/3) * f^(-11/3)
+        # This simplifies to: A = N^2 * df * sqrt(W_phi) = N * sqrt(W_phi) / pixel_size
         r0_factor = (r0 ** (-5.0 / 3.0))[:, None, None]
         amplitude = xp.sqrt(
-            self.C * r0_factor * self.f_term[None, :, :] * self.freq_grid.dA
+            self.C * r0_factor * self.f_term[None, :, :] * (n_pix ** 4) * (self.df ** 2)
         ).astype(xp.float32)
         
         # Apply PSD and high-pass filter
         Phi_f = W * amplitude * self.HP[None, :, :]
         Phi_f[:, 0, 0] = 0.0 + 0.0j  # Zero DC
         
-        # Transform to spatial domain
+        # Transform to spatial domain (take real part only)
+        # The amplitude formula already accounts for the factor of 2 lost when
+        # taking the real part of a non-Hermitian spectrum
         phi = xp.real(xp.fft.ifft2(Phi_f)).astype(xp.float32)
         
         # Remove piston over pupil
