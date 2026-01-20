@@ -19,9 +19,7 @@ Author: NEBRAA Example
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib import cm
 from matplotlib.colors import LogNorm
-from mpl_toolkits.axes_grid1 import make_axes_locatable
 import sys
 import os
 
@@ -29,110 +27,71 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nebraa.utils.compute import init_backend, get_backend
-from nebraa.physics.zernike import (
-    generate_zernike_phase, 
-    normalize_phase_rms,
-    build_zernike_modes,
-    get_nm_list
-)
-from nebraa.physics.optics import compute_psf
-from nebraa.physics.kolmogorov import KolmogorovGenerator, AtmosphereModel
-from nebraa.instruments.vlt import VLTPupil, VLTLowWindEffect
+from nebraa.physics.zernike import generate_zernike_phase, normalize_phase_rms
+from nebraa.physics.optics import compute_psf, compute_strehl
+from nebraa.physics.kolmogorov import KolmogorovGenerator
+from nebraa.instruments.vlt import VLTPupil, LowWindEffect
 
 
 # =============================================================================
 # Setup Functions
 # =============================================================================
 
-def setup_vlt_pupil(n_pix=256, D=8.2, D_obs=1.116, fill_frac=0.9):
+def setup_vlt_pupil(n_pix=256, wavelength=2.2e-6, pixel_scale_arcsec=13e-3, D=8.2, D_obs=1.116):
     """
-    Create a VLT-like pupil with spiders.
+    Create a VLT pupil with spiders using the VLTPupil class.
     
     Args:
         n_pix: Grid size (pixels)
+        wavelength: Wavelength (meters), default 2.2 μm (K-band)
+        pixel_scale_arcsec: Focal plane pixel scale (arcsec/pixel), default 13 mas (NACO)
         D: Primary mirror diameter (meters)
         D_obs: Obstruction diameter (meters)
-        fill_frac: Fraction of grid filled by pupil
     
     Returns:
         pupil: Pupil amplitude array
         pupil_pixel_size: Physical size of each pixel (meters)
+        pixel_scale_arcsec: Focal plane pixel scale (arcsec/pixel)
+        pupil_radius_pix: Radius of the pupil in pixels
     """
-    backend = get_backend()
-    xp = backend.xp
+    # Convert pixel scale to radians
+    pixel_scale_rad = pixel_scale_arcsec * (np.pi / 180 / 3600)
     
-    # Physical pupil pixel size
-    pupil_pixel_size = D / (fill_frac * n_pix)
+    # Create VLT pupil
+    vlt_pupil = VLTPupil(
+        n_pix=n_pix,
+        wavelength=wavelength,
+        pixel_scale=pixel_scale_rad,
+        primary_diameter=D,
+        obstruction_diameter=D_obs,
+    )
     
-    # Build annular pupil at high resolution
-    upscaling = 16
-    n_large = upscaling * n_pix
+    # Add spiders
+    vlt_pupil.add_vlt_spiders(
+        width=0.04,
+        half_opening_deg=51.3,
+        attach_angles_deg=[0.0, 180.0],
+    )
     
-    x = xp.arange(n_large, dtype=xp.float32) * pupil_pixel_size / upscaling
-    x = x - xp.mean(x)
-    X, Y = xp.meshgrid(x, x)
-    R = xp.sqrt(X**2 + Y**2)
+    # Compute pupil radius in pixels
+    pupil_radius_pix = D / (2 * vlt_pupil.pupil_pixel_size)
     
-    # Annular pupil
-    pupil_large = ((R > D_obs/2) & (R < D/2)).astype(xp.float32)
-    
-    # Build spider mask
-    spider_width = 0.04  # meters
-    half_w = spider_width / 2
-    half_opening = np.radians(51.3)
-    
-    # VLT spider geometry: 2 attachment points at 0° and 180°
-    # Each has 2 vanes at ±half_opening from radial
-    spider_mask = xp.ones((n_large, n_large), dtype=xp.float32)
-    
-    for attach_angle in [0.0, np.pi]:
-        for sign in [-1, 1]:
-            vane_angle = attach_angle + sign * half_opening
-            # Direction of vane
-            ux = np.cos(vane_angle)
-            uy = np.sin(vane_angle)
-            
-            # For each point, compute perpendicular distance to vane line
-            # Line from center along direction (ux, uy)
-            perp_dist = xp.abs(-X * uy + Y * ux)
-            
-            # Points along the positive direction only (from center outward)
-            along_dist = X * ux + Y * uy
-            
-            # Within spider width and in the right half-plane
-            in_spider = (perp_dist < half_w) & (along_dist > 0) & (R > D_obs/2) & (R < D/2)
-            spider_mask = spider_mask * (~in_spider).astype(xp.float32)
-    
-    # Apply spider to pupil
-    pupil_large = pupil_large * spider_mask
-    
-    # Rebin to target size
-    sh = (n_pix, n_large // n_pix, n_pix, n_large // n_pix)
-    pupil = pupil_large.reshape(sh).mean(-1).mean(1)
-    
-    return pupil, pupil_pixel_size
-
-
-def compute_strehl(pupil, phase, xp):
-    """Compute Strehl ratio from pupil and phase."""
-    # Reference PSF (no aberrations)
-    ref_psf = compute_psf(pupil, xp.zeros_like(phase), normalize=False)
-    ref_peak = float(xp.max(ref_psf))
-    
-    # Aberrated PSF
-    psf = compute_psf(pupil, phase, normalize=False)
-    peak = float(xp.max(psf))
-    
-    return peak / ref_peak
+    return vlt_pupil.amplitude, vlt_pupil.pupil_pixel_size, pixel_scale_arcsec, pupil_radius_pix
 
 
 # =============================================================================
 # Test Functions
 # =============================================================================
 
-def test_marechal_approximation(pupil, n_pix, n_samples=50):
+def test_marechal_approximation(pupil, n_pix, pupil_radius_pix, n_samples=50):
     """
     Test the Maréchal approximation: S ≈ exp(-σ²).
+    
+    Args:
+        pupil: Pupil mask
+        n_pix: Grid size
+        pupil_radius_pix: Radius of pupil in pixels (for Zernike generation)
+        n_samples: Number of random samples per RMS value
     
     Returns:
         rms_values: Array of RMS values tested
@@ -145,24 +104,26 @@ def test_marechal_approximation(pupil, n_pix, n_samples=50):
     measured_mean = []
     measured_std = []
     
-    # Reference PSF
-    ref_psf = compute_psf(pupil, xp.zeros((n_pix, n_pix), dtype=xp.float32), normalize=False)
-    ref_peak = float(xp.max(ref_psf))
+    # Limit max Zernike order to what can be properly sampled
+    # Nyquist: n_max ≈ pupil_radius / 2
+    n_max = max(5, min(50, int(pupil_radius_pix / 2)))
     
     for rms_target in rms_values:
         strehls = []
         for seed in range(n_samples):
             # Generate phase with many Zernike modes for realistic turbulence
+            # Use correct pupil radius for Zernike generation
             raw_phase = generate_zernike_phase(
-                1, n_pix, n_pix / 2, 
-                n_range=(2, 20),  # Wide range of modes
+                1, n_pix, pupil_radius_pix, 
+                n_range=(2, n_max),
                 power_law=11/3,   # Kolmogorov-like
                 seed=seed
             )
             phase = normalize_phase_rms(raw_phase, pupil, rms_target)[0]
             
-            psf = compute_psf(pupil, phase, normalize=False)
-            strehls.append(float(xp.max(psf)) / ref_peak)
+            # Use phasor average Strehl (not PSF peak)
+            strehl = compute_strehl(phase, pupil)
+            strehls.append(strehl)
         
         measured_mean.append(np.mean(strehls))
         measured_std.append(np.std(strehls))
@@ -172,7 +133,7 @@ def test_marechal_approximation(pupil, n_pix, n_samples=50):
     return rms_values, np.array(measured_mean), np.array(measured_std), theory_strehls
 
 
-def test_power_law_effect(pupil, n_pix, rms_fixed=0.5, n_samples=30):
+def test_power_law_effect(pupil, n_pix, pupil_radius_pix, rms_fixed=0.5, n_samples=30):
     """
     Test how power-law affects Strehl at fixed RMS.
     
@@ -181,26 +142,27 @@ def test_power_law_effect(pupil, n_pix, rms_fixed=0.5, n_samples=30):
     """
     xp = get_backend().xp
     
-    power_law_values = np.array([1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0])
+    power_law_values = np.array([-1, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0])
     measured_mean = []
     measured_std = []
     
-    ref_psf = compute_psf(pupil, xp.zeros((n_pix, n_pix), dtype=xp.float32), normalize=False)
-    ref_peak = float(xp.max(ref_psf))
+    # Limit max Zernike order to what can be properly sampled
+    n_max = max(5, min(50, int(pupil_radius_pix / 2)))
     
     for power_law in power_law_values:
         strehls = []
         for seed in range(n_samples):
             raw_phase = generate_zernike_phase(
-                1, n_pix, n_pix / 2,
-                n_range=(2, 20),
+                1, n_pix, pupil_radius_pix,
+                n_range=(2, n_max),
                 power_law=power_law,
                 seed=seed
             )
             phase = normalize_phase_rms(raw_phase, pupil, rms_fixed)[0]
             
-            psf = compute_psf(pupil, phase, normalize=False)
-            strehls.append(float(xp.max(psf)) / ref_peak)
+            # Use phasor average Strehl (not PSF peak)
+            strehl = compute_strehl(phase, pupil)
+            strehls.append(strehl)
         
         measured_mean.append(np.mean(strehls))
         measured_std.append(np.std(strehls))
@@ -215,7 +177,7 @@ def test_kolmogorov_hf(pupil, pupil_pixel_size, n_pix):
     xp = get_backend().xp
     
     # Different actuator pitches (smaller = better AO = higher cutoff)
-    pitches = [1.0, 0.5, 0.3, 0.2, 0.15, 0.1]  # meters
+    pitches = [10, 1.0, 0.5, 0.3, 0.2, 0.15, 0.1]  # meters
     r0 = 0.15  # Fried parameter (meters)
     
     results = []
@@ -245,32 +207,28 @@ def test_kolmogorov_hf(pupil, pupil_pixel_size, n_pix):
     return results
 
 
-def test_lwe(pupil, pupil_pixel_size, n_pix, D=8.2):
+def test_lwe(pupil):
     """
     Test Low Wind Effect.
     """
     xp = get_backend().xp
     
-    # Need to compute wavelength and pixel_scale from pupil_pixel_size
-    # For LWE we just need consistent coordinates, so use nominal values
-    wavelength = 2.2e-6
-    pixel_scale = wavelength / (n_pix * pupil_pixel_size)
-    
-    lwe = VLTLowWindEffect(
-        n_pix=n_pix,
-        wavelength=wavelength,
-        pixel_scale=pixel_scale,
-        D=D,
+    # Create LWE model from the pupil - automatically detects islands
+    lwe = LowWindEffect(
+        pupil=pupil,
         piston_rms_rad=0.5,
         tilt_rms_rad=0.3,
-        ar_coeff=0.0,
-        half_opening_deg=51.3,
     )
     
-    lwe_phase = lwe.generate(1, pupil, seed=42)[0]
-    rms = float(xp.sqrt(xp.sum(lwe_phase**2 * pupil) / xp.sum(pupil)))
+    print(f"  Detected {lwe.n_islands} pupil islands")
     
-    return lwe_phase, rms
+    lwe_phase = lwe.generate(1, seed=42)[0]
+    
+    # Apply pupil mask and compute RMS
+    lwe_phase_masked = lwe_phase * pupil
+    rms = float(xp.sqrt(xp.sum(lwe_phase_masked**2) / xp.sum(pupil)))
+    
+    return lwe_phase_masked, rms
 
 
 # =============================================================================
@@ -329,6 +287,204 @@ def plot_power_law_test(power_laws, measured_mean, measured_std, rms_fixed):
     ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
+    return fig
+
+
+def plot_power_law_phase_psf(pupil, n_pix, pupil_radius_pix, rms_fixed=0.5, seed=42):
+    """
+    Visualize the effect of power-law exponent on phase structure and PSF.
+    
+    Shows phase maps and PSFs for different power-law exponents, demonstrating
+    how higher exponents concentrate energy in low-order (smooth) modes while
+    lower exponents include more high-frequency content.
+    
+    Args:
+        pupil: Pupil mask
+        n_pix: Grid size
+        pupil_radius_pix: Pupil radius in pixels
+        rms_fixed: Fixed RMS for all phase screens (radians)
+        seed: Random seed for reproducibility
+    """
+    xp = get_backend().xp
+    pupil_np = np.asarray(pupil)
+    
+    # Power-law values to visualize
+    power_laws = [0.0, 1.0, 2.0, 3.0, 11/3]  # Include Kolmogorov (11/3)
+    power_law_labels = ['α=0 (flat)', 'α=1', 'α=2', 'α=3', 'α=11/3 (Kolmo)']
+    
+    # Use more Zernike modes for better visualization
+    # Increase n_max to better show high-frequency content
+    n_max = max(5, min(50, int(pupil_radius_pix)))
+    
+    # Define cutoff for low/high frequency separation
+    n_cutoff = max(5, n_max // 3)  # Low-order = n <= n_cutoff
+    
+    # Create figure: 5 rows x len(power_laws) columns
+    # Row 1: Full phase maps
+    # Row 2: Low-order (n <= n_cutoff) phase only
+    # Row 3: High-order (n > n_cutoff) phase only  
+    # Row 4: Zernike variance spectrum
+    # Row 5: PSFs (log scale)
+    n_cols = len(power_laws)
+    fig, axes = plt.subplots(5, n_cols, figsize=(4*n_cols, 18))
+    
+    phases_full = []
+    phases_low = []
+    phases_high = []
+    psfs = []
+    strehls = []
+    all_coeffs = []
+    
+    # Pre-generate the Zernike modes and a fixed set of unit-variance coefficients
+    from nebraa.physics.zernike import build_zernike_modes, get_nm_list
+    
+    modes = build_zernike_modes(n_pix, pupil_radius_pix, (2, n_max))
+    nm_list = get_nm_list(2, n_max)
+    n_modes = modes.shape[0]
+    
+    # Generate base coefficients with unit variance (same for all power-laws)
+    xp.random.seed(seed)
+    base_coeffs = xp.random.randn(n_modes).astype(xp.float32)
+    
+    # Generate phase for each power-law
+    for i, (plaw, label) in enumerate(zip(power_laws, power_law_labels)):
+        # Apply power-law scaling to base coefficients
+        coeffs = base_coeffs.copy()
+        for j, (n, m) in enumerate(nm_list):
+            scale = (n + 1) ** (-plaw / 2)  # Variance scales as n^(-power_law)
+            coeffs[j] *= scale
+        
+        all_coeffs.append(np.asarray(coeffs.copy()))
+        
+        # Compute FULL phase
+        modes_flat = modes.reshape(n_modes, -1)
+        phase_flat = xp.dot(coeffs, modes_flat)
+        raw_phase = phase_flat.reshape(1, n_pix, n_pix)
+        phase_full = normalize_phase_rms(raw_phase, pupil, rms_fixed)[0]
+        phases_full.append(phase_full)
+        
+        # Compute LOW-order phase (n <= n_cutoff)
+        coeffs_low = coeffs.copy()
+        for j, (n, m) in enumerate(nm_list):
+            if n > n_cutoff:
+                coeffs_low[j] = 0
+        phase_low_flat = xp.dot(coeffs_low, modes_flat)
+        phase_low = phase_low_flat.reshape(n_pix, n_pix)
+        phases_low.append(phase_low)
+        
+        # Compute HIGH-order phase (n > n_cutoff)
+        coeffs_high = coeffs.copy()
+        for j, (n, m) in enumerate(nm_list):
+            if n <= n_cutoff:
+                coeffs_high[j] = 0
+        phase_high_flat = xp.dot(coeffs_high, modes_flat)
+        phase_high = phase_high_flat.reshape(n_pix, n_pix)
+        phases_high.append(phase_high)
+        
+        # Compute PSF and Strehl from full phase
+        psf = compute_psf(pupil, phase_full, normalize=True)
+        psfs.append(psf)
+        strehl = compute_strehl(phase_full, pupil)
+        strehls.append(strehl)
+    
+    # Compute RMS for low and high components
+    def get_rms(phase, mask):
+        p = np.asarray(phase)
+        m = np.asarray(mask)
+        return np.sqrt(np.mean(p[m > 0.5]**2))
+    
+    # Find global color scales
+    vmax_full = max(np.nanmax(np.abs(np.where(pupil_np > 0.5, np.asarray(p), np.nan))) 
+                    for p in phases_full)
+    vmax_full = max(0.5, vmax_full)
+    
+    vmax_high = max(np.nanmax(np.abs(np.where(pupil_np > 0.5, np.asarray(p), np.nan))) 
+                    for p in phases_high)
+    vmax_high = max(0.1, vmax_high)
+    
+    # Plot each power-law
+    for i, (label, coeffs_np) in enumerate(zip(power_law_labels, all_coeffs)):
+        phase_full_np = np.asarray(phases_full[i])
+        phase_low_np = np.asarray(phases_low[i])
+        phase_high_np = np.asarray(phases_high[i])
+        psf_np = np.asarray(psfs[i])
+        strehl = strehls[i]
+        
+        rms_low = get_rms(phases_low[i], pupil)
+        rms_high = get_rms(phases_high[i], pupil)
+        
+        # Row 1: Full phase map
+        ax = axes[0, i]
+        phase_masked = np.where(pupil_np > 0.5, phase_full_np, np.nan)
+        im = ax.imshow(phase_masked, cmap='RdBu_r', vmin=-vmax_full, vmax=vmax_full, 
+                       origin='lower')
+        ax.set_title(f'{label}\nTotal RMS={rms_fixed:.2f} rad', fontsize=11)
+        if i == 0:
+            ax.set_ylabel('Full phase', fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, label='rad', shrink=0.8)
+        
+        # Row 2: Low-order phase (same color scale as full)
+        ax = axes[1, i]
+        phase_masked = np.where(pupil_np > 0.5, phase_low_np, np.nan)
+        im = ax.imshow(phase_masked, cmap='RdBu_r', vmin=-vmax_full, vmax=vmax_full, 
+                       origin='lower')
+        ax.set_title(f'Low (n≤{n_cutoff}) RMS={rms_low:.2f}', fontsize=10)
+        if i == 0:
+            ax.set_ylabel(f'Low-order\n(n≤{n_cutoff})', fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, label='rad', shrink=0.8)
+        
+        # Row 3: High-order phase (INDEPENDENT color scale to show detail)
+        ax = axes[2, i]
+        phase_masked = np.where(pupil_np > 0.5, phase_high_np, np.nan)
+        im = ax.imshow(phase_masked, cmap='RdBu_r', vmin=-vmax_high, vmax=vmax_high, 
+                       origin='lower')
+        ax.set_title(f'High (n>{n_cutoff}) RMS={rms_high:.2f}', fontsize=10)
+        if i == 0:
+            ax.set_ylabel(f'High-order\n(n>{n_cutoff})', fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, label='rad', shrink=0.8)
+        
+        # Row 4: Zernike variance spectrum
+        ax = axes[3, i]
+        n_orders = list(range(2, n_max + 1))
+        var_per_n = []
+        for n in n_orders:
+            var_n = sum(coeffs_np[j]**2 for j, (nn, mm) in enumerate(nm_list) if nn == n)
+            var_per_n.append(var_n)
+        var_per_n = np.array(var_per_n)
+        var_per_n = var_per_n / var_per_n.sum()
+        
+        # Color bars by low/high
+        colors = ['steelblue' if n <= n_cutoff else 'coral' for n in n_orders]
+        ax.bar(n_orders, var_per_n, color=colors, edgecolor='black', alpha=0.7)
+        ax.axvline(n_cutoff + 0.5, color='black', linestyle='--', linewidth=1)
+        ax.set_xlabel('Radial order n', fontsize=10)
+        if i == 0:
+            ax.set_ylabel('Variance fraction', fontsize=12)
+        ax.set_ylim(0, max(0.5, var_per_n.max() * 1.1))
+        ax.set_title('Zernike spectrum', fontsize=10)
+        
+        # Row 5: PSF (log scale)
+        ax = axes[4, i]
+        im = ax.imshow(psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', 
+                       origin='lower')
+        ax.set_title(f'Strehl={strehl:.3f}', fontsize=11)
+        if i == 0:
+            ax.set_ylabel('PSF (log)', fontsize=12)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        plt.colorbar(im, ax=ax, label='Intensity', shrink=0.8)
+    
+    fig.suptitle(f'Power-Law Effect on Phase Structure\n'
+                 f'(Zernike n=2-{n_max}, cutoff n={n_cutoff}, fixed total RMS={rms_fixed} rad)', 
+                 fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
     return fig
 
 
@@ -407,7 +563,7 @@ def plot_pupil_diagnostics(pupil, pupil_pixel_size, n_pix):
     return fig
 
 
-def plot_kolmogorov_hf_test(results, pupil, n_pix):
+def plot_kolmogorov_hf_test(results, pupil):
     """Plot HF Kolmogorov test results."""
     xp = get_backend().xp
     pupil_np = np.asarray(pupil)
@@ -437,7 +593,7 @@ def plot_kolmogorov_hf_test(results, pupil, n_pix):
         psf = compute_psf(pupil, xp.asarray(res['phase']), normalize=True)
         psf_np = np.asarray(psf)
         im = ax.imshow(psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', origin='lower')
-        strehl = compute_strehl(pupil, xp.asarray(res['phase']), xp)
+        strehl = compute_strehl(xp.asarray(res['phase']), pupil)
         ax.set_title(f'PSF (Strehl={strehl:.3f})', fontsize=10)
         plt.colorbar(im, ax=ax, label='Intensity')
     
@@ -467,7 +623,7 @@ def plot_lwe_test(lwe_phase, pupil, n_pix, rms):
     psf = compute_psf(pupil, xp.asarray(lwe_phase), normalize=True)
     psf_np = np.asarray(psf)
     im = ax.imshow(psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', origin='lower')
-    strehl = compute_strehl(pupil, xp.asarray(lwe_phase), xp)
+    strehl = compute_strehl(xp.asarray(lwe_phase), pupil)
     ax.set_title(f'PSF with LWE (Strehl={strehl:.3f})', fontsize=12)
     plt.colorbar(im, ax=ax, label='Intensity')
     
@@ -484,23 +640,31 @@ def plot_lwe_test(lwe_phase, pupil, n_pix, rms):
     return fig
 
 
-def plot_combined_turbulence(pupil, pupil_pixel_size, n_pix):
+def plot_combined_turbulence(pupil, pupil_pixel_size, n_pix, pixel_scale_arcsec, pupil_radius_pix):
     """
-    Generate and plot combined turbulence: LF Zernike + HF Kolmogorov.
+    Generate and plot all three turbulence types: Zernike, HF Kolmogorov, LWE.
+    Shows each component separately and then all combined.
     """
     xp = get_backend().xp
     pupil_np = np.asarray(pupil)
     
-    # Generate LF phase (Zernike)
-    lf_phase_raw = generate_zernike_phase(
-        1, n_pix, n_pix / 2,
-        n_range=(2, 15),
+    # Limit max Zernike order to what can be properly sampled
+    n_max = max(5, min(50, int(pupil_radius_pix / 2)))
+    
+    # -------------------------------------------------------------------------
+    # 1. Generate Zernike (low-frequency) phase
+    # -------------------------------------------------------------------------
+    zernike_phase_raw = generate_zernike_phase(
+        1, n_pix, pupil_radius_pix,
+        n_range=(2, n_max),
         power_law=11/3,  # Kolmogorov-like
         seed=123
     )
-    lf_phase = normalize_phase_rms(lf_phase_raw, pupil, 0.4)[0]  # 0.4 rad RMS
+    zernike_phase = normalize_phase_rms(zernike_phase_raw, pupil, 0.4)[0]  # 0.4 rad RMS
     
-    # Generate HF phase (Kolmogorov)
+    # -------------------------------------------------------------------------
+    # 2. Generate HF Kolmogorov phase
+    # -------------------------------------------------------------------------
     kolmo = KolmogorovGenerator(
         n_pix=n_pix,
         pixel_size=pupil_pixel_size,
@@ -509,56 +673,106 @@ def plot_combined_turbulence(pupil, pupil_pixel_size, n_pix):
     )
     hf_phase = kolmo.generate(1, r0=0.15, pupil=pupil, seed=456)[0]
     
-    # Combined
-    total_phase = lf_phase + hf_phase
+    # -------------------------------------------------------------------------
+    # 3. Generate LWE phase
+    # -------------------------------------------------------------------------
+    lwe = LowWindEffect(pupil, piston_rms_rad=0.3, tilt_rms_rad=0.2)
+    lwe_phase = lwe.generate(1, seed=789)[0]
+    lwe_phase = xp.asarray(lwe_phase)
+    
+    # -------------------------------------------------------------------------
+    # 4. Combined phase (all three)
+    # -------------------------------------------------------------------------
+    total_phase = zernike_phase + hf_phase + lwe_phase
     
     # Compute RMS values
     def get_rms(ph):
         return float(xp.sqrt(xp.sum(ph**2 * pupil) / xp.sum(pupil)))
     
-    lf_rms = get_rms(lf_phase)
+    zernike_rms = get_rms(zernike_phase)
     hf_rms = get_rms(hf_phase)
+    lwe_rms = get_rms(lwe_phase)
     total_rms = get_rms(total_phase)
     
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    # -------------------------------------------------------------------------
+    # Create figure: 2 rows x 5 columns
+    # Row 1: Phase maps
+    # Row 2: PSFs
+    # Columns: Zernike | HF Kolmo | LWE | Combined | Reference
+    # -------------------------------------------------------------------------
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
     
-    phases = [lf_phase, hf_phase, total_phase]
-    titles = [f'LF (Zernike)\nRMS={lf_rms:.3f} rad', 
-              f'HF (Kolmogorov)\nRMS={hf_rms:.3f} rad',
-              f'Combined\nRMS={total_rms:.3f} rad']
+    phases = [zernike_phase, hf_phase, lwe_phase, total_phase]
+    titles = [
+        f'Zernike (LF)\nRMS={zernike_rms:.3f} rad', 
+        f'Kolmogorov (HF)\nRMS={hf_rms:.3f} rad',
+        f'LWE\nRMS={lwe_rms:.3f} rad',
+        f'Combined (All)\nRMS={total_rms:.3f} rad'
+    ]
     
-    for i, (phase, title) in enumerate(zip(phases, titles)):
+    # Find global color scale for phase
+    all_phases_masked = []
+    for phase in phases:
         phase_np = np.asarray(phase)
         phase_masked = np.where(pupil_np > 0.5, phase_np, np.nan)
-        vmax = max(0.5, np.nanmax(np.abs(phase_masked)))
-        
+        all_phases_masked.append(phase_masked)
+    vmax_phase = max(0.5, max(np.nanmax(np.abs(pm)) for pm in all_phases_masked))
+    
+    # Compute extent in arcseconds for PSF display
+    fov_arcsec = n_pix * pixel_scale_arcsec * 1000  # in mas
+    extent_psf = [-fov_arcsec/2, fov_arcsec/2, -fov_arcsec/2, fov_arcsec/2]
+    
+    for i, (phase, title, phase_masked) in enumerate(zip(phases, titles, all_phases_masked)):
+        # Phase map
         ax = axes[0, i]
-        im = ax.imshow(phase_masked, cmap='RdBu_r', vmin=-vmax, vmax=vmax, origin='lower')
+        im = ax.imshow(phase_masked, cmap='RdBu_r', vmin=-vmax_phase, vmax=vmax_phase, origin='lower')
         ax.set_title(title, fontsize=11)
+        ax.set_xlabel('Pixel')
+        ax.set_ylabel('Pixel')
         plt.colorbar(im, ax=ax, label='Phase (rad)')
         
+        # PSF
         ax = axes[1, i]
         psf = compute_psf(pupil, phase, normalize=True)
         psf_np = np.asarray(psf)
-        im = ax.imshow(psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', origin='lower')
-        strehl = compute_strehl(pupil, phase, xp)
+        im = ax.imshow(psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', 
+                       origin='lower', extent=extent_psf)
+        strehl = compute_strehl(phase, pupil)
         ax.set_title(f'PSF (Strehl={strehl:.3f})', fontsize=11)
+        ax.set_xlabel('mas')
+        ax.set_ylabel('mas')
         plt.colorbar(im, ax=ax, label='Intensity')
     
-    # Reference
-    ax = axes[0, 3]
+    # Reference (no aberrations)
+    ax = axes[0, 4]
     ax.imshow(pupil_np, cmap='gray', origin='lower')
     ax.set_title('Pupil', fontsize=11)
+    ax.set_xlabel('Pixel')
+    ax.set_ylabel('Pixel')
     
-    ax = axes[1, 3]
+    ax = axes[1, 4]
     ref_psf = compute_psf(pupil, xp.zeros((n_pix, n_pix), dtype=xp.float32), normalize=True)
     ref_psf_np = np.asarray(ref_psf)
-    im = ax.imshow(ref_psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', origin='lower')
-    ax.set_title('Reference PSF', fontsize=11)
+    im = ax.imshow(ref_psf_np, norm=LogNorm(vmin=1e-5, vmax=1), cmap='inferno', 
+                   origin='lower', extent=extent_psf)
+    ax.set_title('Reference PSF\n(Strehl=1.000)', fontsize=11)
+    ax.set_xlabel('mas')
+    ax.set_ylabel('mas')
     plt.colorbar(im, ax=ax, label='Intensity')
     
-    fig.suptitle('Combined Turbulence: Low-Frequency (Zernike) + High-Frequency (Kolmogorov)', fontsize=14)
+    fig.suptitle('VLT/NACO K-band Turbulence Components\n'
+                 f'λ=2.2 μm, pixel scale=13 mas, pupil pixel={pupil_pixel_size*1000:.1f} mm', 
+                 fontsize=14)
     plt.tight_layout()
+    
+    # Print summary
+    print(f"  Turbulence RMS breakdown:")
+    print(f"    Zernike (LF):     {zernike_rms:.3f} rad")
+    print(f"    Kolmogorov (HF):  {hf_rms:.3f} rad")
+    print(f"    LWE:              {lwe_rms:.3f} rad")
+    print(f"    Combined:         {total_rms:.3f} rad")
+    print(f"    Quadratic sum:    {np.sqrt(zernike_rms**2 + hf_rms**2 + lwe_rms**2):.3f} rad")
+    
     return fig
 
 
@@ -569,7 +783,7 @@ def plot_combined_turbulence(pupil, pupil_pixel_size, n_pix):
 def main():
     """Main function to run all tests."""
     print("=" * 70)
-    print("VLT Turbulence and PSF Study (V2)")
+    print("VLT/NACO K-band Turbulence Study")
     print("=" * 70)
     
     # Create output directory
@@ -582,28 +796,39 @@ def main():
     xp = get_backend().xp
     print("✓ Backend initialized (CPU mode)")
     
-    # Parameters
+    # Parameters - NACO K-band
     n_pix = 256
+    wavelength = 2.2e-6  # K-band (meters)
+    pixel_scale_arcsec = 13e-3  # NACO pixel scale (arcsec/pixel)
     D = 8.2  # VLT primary diameter (m)
     D_obs = 1.116  # Central obstruction (m)
     
-    # Create VLT pupil with correct physical scaling
-    print("\n[1/6] Creating VLT pupil...")
-    pupil, pupil_pixel_size = setup_vlt_pupil(n_pix, D, D_obs)
+    # Create VLT pupil with NACO K-band parameters
+    print("\n[1/7] Creating VLT pupil (NACO K-band)...")
+    pupil, pupil_pixel_size, pixel_scale, pupil_radius_pix = setup_vlt_pupil(
+        n_pix=n_pix, 
+        wavelength=wavelength,
+        pixel_scale_arcsec=pixel_scale_arcsec,
+        D=D, 
+        D_obs=D_obs
+    )
+    print(f"  Wavelength: {wavelength*1e6:.1f} μm (K-band)")
+    print(f"  Pixel scale: {pixel_scale*1000:.1f} mas/pixel")
     print(f"  Grid size: {n_pix} x {n_pix}")
     print(f"  Pupil pixel size: {pupil_pixel_size*1000:.2f} mm")
+    print(f"  Pupil radius: {pupil_radius_pix:.1f} pixels")
     print(f"  Total pupil extent: {pupil_pixel_size * n_pix:.2f} m")
     print(f"  Nyquist frequency: {1/(2*pupil_pixel_size):.1f} cy/m")
     
     # Pupil diagnostics
-    print("\n[2/6] Pupil diagnostics...")
+    print("\n[2/7] Pupil diagnostics...")
     fig_pupil = plot_pupil_diagnostics(pupil, pupil_pixel_size, n_pix)
     fig_pupil.savefig(os.path.join(output_dir, 'vlt_pupil_diagnostics.png'), dpi=150, bbox_inches='tight')
     print("  Saved: vlt_pupil_diagnostics.png")
     
     # Test Maréchal approximation
-    print("\n[3/6] Testing Maréchal approximation...")
-    rms_vals, meas_mean, meas_std, theory = test_marechal_approximation(pupil, n_pix, n_samples=30)
+    print("\n[3/7] Testing Maréchal approximation...")
+    rms_vals, meas_mean, meas_std, theory = test_marechal_approximation(pupil, n_pix, pupil_radius_pix, n_samples=30)
     fig_marechal = plot_marechal_test(rms_vals, meas_mean, meas_std, theory)
     fig_marechal.savefig(os.path.join(output_dir, 'vlt_marechal_test.png'), dpi=150, bbox_inches='tight')
     print("  Saved: vlt_marechal_test.png")
@@ -615,17 +840,23 @@ def main():
         print(f"  {rms:.1f}       | {meas_mean[i]:.4f}±{meas_std[i]:.3f} | {theory[i]:.4f}   | {meas_mean[i]-theory[i]:+.4f}")
     
     # Test power-law effect
-    print("\n[4/6] Testing power-law effect...")
-    plaws, plaw_mean, plaw_std = test_power_law_effect(pupil, n_pix, rms_fixed=0.5, n_samples=30)
+    print("\n[4/7] Testing power-law effect...")
+    plaws, plaw_mean, plaw_std = test_power_law_effect(pupil, n_pix, pupil_radius_pix, rms_fixed=0.5, n_samples=30)
     fig_plaw = plot_power_law_test(plaws, plaw_mean, plaw_std, rms_fixed=0.5)
     fig_plaw.savefig(os.path.join(output_dir, 'vlt_powerlaw_test.png'), dpi=150, bbox_inches='tight')
     print("  Saved: vlt_powerlaw_test.png")
     
+    # Power-law phase/PSF visualization
+    print("\n[5/7] Visualizing power-law effects on phase and PSF...")
+    fig_plaw_viz = plot_power_law_phase_psf(pupil, n_pix, pupil_radius_pix, rms_fixed=0.5, seed=42)
+    fig_plaw_viz.savefig(os.path.join(output_dir, 'vlt_powerlaw_visualization.png'), dpi=150, bbox_inches='tight')
+    print("  Saved: vlt_powerlaw_visualization.png")
+    
     # Test Kolmogorov HF
-    print("\n[5/6] Testing high-frequency Kolmogorov...")
+    print("\n[6/7] Testing high-frequency Kolmogorov...")
     hf_results = test_kolmogorov_hf(pupil, pupil_pixel_size, n_pix)
     if hf_results:
-        fig_hf = plot_kolmogorov_hf_test(hf_results, pupil, n_pix)
+        fig_hf = plot_kolmogorov_hf_test(hf_results, pupil)
         if fig_hf:
             fig_hf.savefig(os.path.join(output_dir, 'vlt_kolmogorov_hf_test.png'), dpi=150, bbox_inches='tight')
             print("  Saved: vlt_kolmogorov_hf_test.png")
@@ -636,16 +867,16 @@ def main():
             print(f"  {res['pitch']:.2f} m         | {res['fc']:.1f} cy/m     | {res['rms']:.4f} rad")
     
     # Test LWE
-    print("\n[6/6] Testing Low Wind Effect...")
-    lwe_phase, lwe_rms = test_lwe(pupil, pupil_pixel_size, n_pix, D)
+    print("\n[7/7] Testing Low Wind Effect...")
+    lwe_phase, lwe_rms = test_lwe(pupil)
     fig_lwe = plot_lwe_test(lwe_phase, pupil, n_pix, lwe_rms)
     fig_lwe.savefig(os.path.join(output_dir, 'vlt_lwe_test.png'), dpi=150, bbox_inches='tight')
     print("  Saved: vlt_lwe_test.png")
     print(f"  LWE phase RMS: {lwe_rms:.3f} rad")
     
-    # Combined turbulence demo
-    print("\n[Bonus] Combined turbulence demonstration...")
-    fig_combined = plot_combined_turbulence(pupil, pupil_pixel_size, n_pix)
+    # Combined turbulence demo (Zernike + HF Kolmogorov + LWE)
+    print("\n[Bonus] Combined turbulence demonstration (all 3 types)...")
+    fig_combined = plot_combined_turbulence(pupil, pupil_pixel_size, n_pix, pixel_scale, pupil_radius_pix)
     fig_combined.savefig(os.path.join(output_dir, 'vlt_combined_turbulence.png'), dpi=150, bbox_inches='tight')
     print("  Saved: vlt_combined_turbulence.png")
     
@@ -653,7 +884,7 @@ def main():
     print("✓ All tests complete!")
     print("=" * 70)
     
-    plt.show()
+    # plt.show()
 
 
 if __name__ == '__main__':

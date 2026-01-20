@@ -8,6 +8,7 @@ instruments and simulation modes:
 - kolmogorov: Atmospheric turbulence models
 - optics: Basic optical propagation (PSF computation, Fourier optics)
 - noise: Detector noise models
+- jolissaint_ao: Analytical AO model for long-exposure PSF (Jolissaint et al. 2006)
 """
 
 from .zernike import (
@@ -38,6 +39,16 @@ from .noise import (
     compute_snr,
 )
 
+from .jolissaint_ao import (
+    TurbulentLayer,
+    AtmosphereProfile,
+    AOSystemConfig,
+    JolissaintAOModel,
+    create_simple_atmosphere,
+    create_mauna_kea_atmosphere,
+    create_ao_config,
+)
+
 __all__ = [
     # Zernike
     'zernike_nm',
@@ -59,4 +70,12 @@ __all__ = [
     'add_read_noise',
     'add_background',
     'compute_snr',
+    # Jolissaint AO model
+    'TurbulentLayer',
+    'AtmosphereProfile',
+    'AOSystemConfig',
+    'JolissaintAOModel',
+    'create_simple_atmosphere',
+    'create_mauna_kea_atmosphere',
+    'create_ao_config',
 ]
