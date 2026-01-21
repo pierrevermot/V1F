@@ -167,6 +167,11 @@ class AOSystemConfig:
         include_servo_lag: Whether to include servo-lag error
         include_anisoplanatism: Whether to include anisoplanatism error
         include_noise: Whether to include WFS noise error
+        mask_geometry: Shape of LF/HF correction masks:
+                       'circular' (default, realistic) or 'square' (Jolissaint paper convention)
+        mask_rolloff: Smoothness of mask transition. 0.0 = hard cutoff, >0 = smooth transition.
+                      Recommended: 0.1 * f_ao for realistic modal reconstructor behavior.
+                      The mask uses a sigmoid: 1/(1 + exp((F - f0)/delta)) with delta = rolloff.
     """
     actuator_pitch: float
     wfs_subaperture_size: Optional[float] = None  # Default to actuator_pitch
@@ -180,10 +185,14 @@ class AOSystemConfig:
     include_servo_lag: bool = True
     include_anisoplanatism: bool = True
     include_noise: bool = True
+    mask_geometry: str = 'circular'  # 'circular' or 'square'
+    mask_rolloff: float = 0.0  # Smooth transition width (0 = hard cutoff)
     
     def __post_init__(self):
         if self.wfs_subaperture_size is None:
             self.wfs_subaperture_size = self.actuator_pitch
+        if self.mask_geometry not in ('circular', 'square'):
+            raise ValueError(f"mask_geometry must be 'circular' or 'square', got '{self.mask_geometry}'")
     
     @property
     def f_ao(self) -> float:
@@ -504,16 +513,40 @@ class JolissaintAOModel:
         
         f_ao = self.ao_config.f_ao
         f_wfs = self.ao_config.f_wfs
+        geometry = self.ao_config.mask_geometry
+        rolloff = self.ao_config.mask_rolloff
         
-        # Low-frequency mask for DM: |fx|, |fy| < f_ao (square geometry for SH-WFS)
-        # [Section 4.C: "the LF domain is defined by |fx|,|fy| < f_ao (a square)"]
-        self.mu_LF = ((xp.abs(self.FX) < f_ao) & (xp.abs(self.FY) < f_ao)).astype(xp.float64)
+        # Build masks based on geometry and rolloff settings
+        if geometry == 'circular':
+            # Circular (radial) support - realistic for modal control
+            if rolloff > 0:
+                # Smooth sigmoid roll-off: 1/(1 + exp((F - f0)/delta))
+                # This models the gradual cutoff of modal reconstructors
+                self.mu_LF = 1.0 / (1.0 + xp.exp((self.F - f_ao) / rolloff))
+                self.mu_WFS = 1.0 / (1.0 + xp.exp((self.F - f_wfs) / rolloff))
+            else:
+                # Hard circular cutoff
+                self.mu_LF = (self.F < f_ao).astype(xp.float64)
+                self.mu_WFS = (self.F < f_wfs).astype(xp.float64)
+        else:
+            # Square support - Jolissaint paper convention for SH-WFS
+            # [Section 4.C: "the LF domain is defined by |fx|,|fy| < f_ao (a square)"]
+            if rolloff > 0:
+                # Smooth square mask using product of sigmoids on each axis
+                mask_x_ao = 1.0 / (1.0 + xp.exp((xp.abs(self.FX) - f_ao) / rolloff))
+                mask_y_ao = 1.0 / (1.0 + xp.exp((xp.abs(self.FY) - f_ao) / rolloff))
+                self.mu_LF = mask_x_ao * mask_y_ao
+                
+                mask_x_wfs = 1.0 / (1.0 + xp.exp((xp.abs(self.FX) - f_wfs) / rolloff))
+                mask_y_wfs = 1.0 / (1.0 + xp.exp((xp.abs(self.FY) - f_wfs) / rolloff))
+                self.mu_WFS = mask_x_wfs * mask_y_wfs
+            else:
+                # Hard square cutoff
+                self.mu_LF = ((xp.abs(self.FX) < f_ao) & (xp.abs(self.FY) < f_ao)).astype(xp.float64)
+                self.mu_WFS = ((xp.abs(self.FX) < f_wfs) & (xp.abs(self.FY) < f_wfs)).astype(xp.float64)
         
-        # High-frequency mask (DM)
+        # High-frequency mask (DM) - complement of LF mask
         self.mu_HF = 1.0 - self.mu_LF
-        
-        # WFS domain mask: |fx|, |fy| < f_wfs (for noise PSD, per paper after Eq. 50)
-        self.mu_WFS = ((xp.abs(self.FX) < f_wfs) & (xp.abs(self.FY) < f_wfs)).astype(xp.float64)
         
         # Piston filter (for fitting PSD etc.)
         self.Fp = piston_filter(self.F, self.D)
@@ -785,8 +818,11 @@ class JolissaintAOModel:
             fy_alias = FY_3d - l_arr / Lambda
             f_alias = xp.sqrt(fx_alias**2 + fy_alias**2)
             
-            # HF mask: outside WFS Nyquist
-            is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
+            # HF mask: outside WFS Nyquist (geometry matches mask_geometry setting)
+            if self.ao_config.mask_geometry == 'circular':
+                is_hf = f_alias >= f_wfs
+            else:
+                is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
             
             # Von Karman PSD at aliased frequencies
             L0_inv2 = 1.0 / self.atmosphere.L0**2 if self.atmosphere.L0 else 0
@@ -836,7 +872,8 @@ class JolissaintAOModel:
             FY_3d_l = self.FY[None, :, :]  # (1, n_pix, n_pix)
             fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda  # (6, n_pix, n_pix)
             f_al_fx0 = xp.abs(fy_al_3d)
-            is_hf_fx0 = xp.abs(fy_al_3d) >= f_wfs
+            # HF check for singularity cases (1D - always radial since fx=0 or fy=0)
+            is_hf_fx0 = f_al_fx0 >= f_wfs
             if self.atmosphere.L0 is not None:
                 psd_fx0_3d = coeff * xp.power(f_al_fx0**2 + L0_inv2, -11/6)
             else:
@@ -849,7 +886,8 @@ class JolissaintAOModel:
             FX_3d_k = self.FX[None, :, :]
             fx_al_3d = FX_3d_k - k_vals[:, None, None] / Lambda
             f_al_fy0 = xp.abs(fx_al_3d)
-            is_hf_fy0 = xp.abs(fx_al_3d) >= f_wfs
+            # HF check for singularity cases (1D - always radial since fx=0 or fy=0)
+            is_hf_fy0 = f_al_fy0 >= f_wfs
             if self.atmosphere.L0 is not None:
                 psd_fy0_3d = coeff * xp.power(f_al_fy0**2 + L0_inv2, -11/6)
             else:
@@ -914,8 +952,12 @@ class JolissaintAOModel:
                     fy_alias = self.FY - l / Lambda
                     f_alias = xp.sqrt(fx_alias**2 + fy_alias**2)
                     
-                    # Only spatial frequencies outside the WFS Nyquist square alias into LF
-                    is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
+                    # Only spatial frequencies outside the WFS Nyquist alias into LF
+                    # Geometry matches mask_geometry setting
+                    if self.ao_config.mask_geometry == 'circular':
+                        is_hf = f_alias >= f_wfs
+                    else:
+                        is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
                     
                     # Turbulent PSD at aliased frequency
                     if self.atmosphere.L0 is not None:
@@ -973,7 +1015,8 @@ class JolissaintAOModel:
                     continue
                 fy_alias = self.FY - l / Lambda
                 f_alias = xp.abs(fy_alias)
-                is_hf_l = xp.abs(fy_alias) >= f_wfs
+                # HF check (1D case - always radial since fx=0)
+                is_hf_l = f_alias >= f_wfs
                 if self.atmosphere.L0 is not None:
                     psd_l = von_karman_psd(f_alias, r0_sci, self.atmosphere.L0)
                 else:
@@ -989,7 +1032,8 @@ class JolissaintAOModel:
                     continue
                 fx_alias = self.FX - k / Lambda
                 f_alias = xp.abs(fx_alias)
-                is_hf_k = xp.abs(fx_alias) >= f_wfs
+                # HF check (1D case - always radial since fy=0)
+                is_hf_k = f_alias >= f_wfs
                 if self.atmosphere.L0 is not None:
                     psd_k = von_karman_psd(f_alias, r0_sci, self.atmosphere.L0)
                 else:
