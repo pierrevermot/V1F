@@ -359,6 +359,9 @@ class PistonFilterLUT:
         j1_vals = scipy_j1(self.x_lut)
         self.j1_over_x_lut = j1_vals / self.x_lut
         self.j1_over_x_lut[0] = 0.5  # Limit as x->0: J1(x)/x -> 1/2
+        
+        # Cache for GPU-side LUT to avoid repeated CPU->GPU transfers
+        self._gpu_lut_cache = None
     
     def __call__(self, f) -> ArrayLike:
         """
@@ -383,8 +386,13 @@ class PistonFilterLUT:
         idx = (x / self.dx).astype(xp.int64)
         frac = (x / self.dx) - idx
         
-        # Convert LUT to backend array if needed
-        j1_over_x_lut = xp.asarray(self.j1_over_x_lut)
+        # Use cached GPU array to avoid repeated CPU->GPU transfers
+        if backend.gpu:
+            if self._gpu_lut_cache is None:
+                self._gpu_lut_cache = xp.asarray(self.j1_over_x_lut)
+            j1_over_x_lut = self._gpu_lut_cache
+        else:
+            j1_over_x_lut = self.j1_over_x_lut
         
         # Interpolate
         idx_next = xp.minimum(idx + 1, self.n_points - 1)
@@ -460,6 +468,13 @@ class JolissaintAOModel:
         
         # Precompute masks and filters
         self._setup_masks()
+        
+        # Precompute aliasing index arrays for vectorized computation
+        self._precompute_aliasing_arrays()
+        
+        # Cache backend reference to avoid repeated get_backend() calls
+        self._backend = get_backend()
+        self._xp = self._backend.xp
     
     def _setup_frequency_grid(self):
         """Setup spatial frequency grid in pupil plane."""
@@ -508,6 +523,31 @@ class JolissaintAOModel:
         f_max_grid = float(backend.to_numpy(xp.max(self.F)))
         f_max_lut = f_max_grid + 5.0 / self.ao_config.wfs_subaperture_size
         self._piston_lut = PistonFilterLUT(self.D, f_max=f_max_lut, n_points=20000)
+    
+    def _precompute_aliasing_arrays(self):
+        """Precompute index arrays used in vectorized aliasing computation."""
+        backend = get_backend()
+        xp = backend.xp
+        n_alias = 3
+        
+        # (k,l) pairs excluding (0,0) for main aliasing sum
+        kl_pairs = [(k, l) for k in range(-n_alias, n_alias + 1)
+                    for l in range(-n_alias, n_alias + 1) if not (k == 0 and l == 0)]
+        self._alias_k_arr = xp.array([kl[0] for kl in kl_pairs], dtype=xp.float64)[:, None, None]
+        self._alias_l_arr = xp.array([kl[1] for kl in kl_pairs], dtype=xp.float64)[:, None, None]
+        self._alias_sign_arr = xp.array([(-1) ** (kl[0] + kl[1]) for kl in kl_pairs], dtype=xp.float64)[:, None, None]
+        
+        # l != 0 for fx=0 singularity case
+        self._alias_l_vals = xp.array([l for l in range(-n_alias, n_alias + 1) if l != 0], dtype=xp.float64)
+        
+        # k != 0 for fy=0 singularity case
+        self._alias_k_vals = xp.array([k for k in range(-n_alias, n_alias + 1) if k != 0], dtype=xp.float64)
+        
+        # (k,l) with k != 0 AND l != 0 for (0,0) singularity case
+        kl_00 = [(k, l) for k in range(-n_alias, n_alias + 1)
+                 for l in range(-n_alias, n_alias + 1) if k != 0 and l != 0]
+        self._alias_k_00 = xp.array([kl[0] for kl in kl_00], dtype=xp.float64)
+        self._alias_l_00 = xp.array([kl[1] for kl in kl_00], dtype=xp.float64)
     
     def _turbulent_psd_layer(self, layer: TurbulentLayer) -> ArrayLike:
         """
@@ -713,26 +753,18 @@ class JolissaintAOModel:
         Vectorized GPU-optimized aliasing PSD computation.
         
         Stacks all (k,l) terms into a 3D tensor for parallel processing.
+        Uses precomputed index arrays to avoid repeated allocations.
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         Lambda = self.ao_config.wfs_subaperture_size
         f_wfs = self.ao_config.f_wfs
         dt = self.ao_config.integration_time
-        n_alias = 3
         
-        # Build list of (k, l) pairs excluding (0, 0)
-        kl_pairs = [(k, l) for k in range(-n_alias, n_alias + 1)
-                    for l in range(-n_alias, n_alias + 1) if not (k == 0 and l == 0)]
-        n_terms = len(kl_pairs)
-        
-        # Create arrays for k and l values: shape (n_terms, 1, 1)
-        k_arr = xp.array([kl[0] for kl in kl_pairs], dtype=xp.float64)[:, None, None]
-        l_arr = xp.array([kl[1] for kl in kl_pairs], dtype=xp.float64)[:, None, None]
-        
-        # Sign factors: (-1)^(k+l), shape (n_terms, 1, 1)
-        sign_arr = xp.array([(-1) ** (kl[0] + kl[1]) for kl in kl_pairs], dtype=xp.float64)[:, None, None]
+        # Use precomputed index arrays
+        k_arr = self._alias_k_arr
+        l_arr = self._alias_l_arr
+        sign_arr = self._alias_sign_arr
         
         psd_alias = xp.zeros_like(self.F, dtype=xp.float64)
         
@@ -795,13 +827,12 @@ class JolissaintAOModel:
             # Main PSD contribution
             psd_layer = prefactor * sinc2_temporal * complex_sum**2
             
-            # Handle axis singularities - VECTORIZED for GPU
+            # Handle axis singularities - VECTORIZED for GPU using precomputed arrays
             fx_zero = xp.abs(self.FX) < 1e-10
             fy_zero = xp.abs(self.FY) < 1e-10
             
-            # Build l_vals for fx=0 case (l != 0): shape (6,)
-            l_vals = xp.array([l for l in range(-n_alias, n_alias + 1) if l != 0], dtype=xp.float64)
-            # Broadcast FY to (6, n_pix, n_pix)
+            # fx=0 case using precomputed l_vals (l != 0): shape (6,)
+            l_vals = self._alias_l_vals
             FY_3d_l = self.FY[None, :, :]  # (1, n_pix, n_pix)
             fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda  # (6, n_pix, n_pix)
             f_al_fx0 = xp.abs(fy_al_3d)
@@ -813,8 +844,8 @@ class JolissaintAOModel:
             Fp_fx0_3d = self._piston_lut(f_al_fx0)
             psd_fx0 = xp.sum(is_hf_fx0.astype(xp.float64) * Fp_fx0_3d * psd_fx0_3d, axis=0) * sinc2_temporal
             
-            # Build k_vals for fy=0 case (k != 0): shape (6,)
-            k_vals = xp.array([k for k in range(-n_alias, n_alias + 1) if k != 0], dtype=xp.float64)
+            # fy=0 case using precomputed k_vals (k != 0): shape (6,)
+            k_vals = self._alias_k_vals
             FX_3d_k = self.FX[None, :, :]
             fx_al_3d = FX_3d_k - k_vals[:, None, None] / Lambda
             f_al_fy0 = xp.abs(fx_al_3d)
@@ -826,11 +857,9 @@ class JolissaintAOModel:
             Fp_fy0_3d = self._piston_lut(f_al_fy0)
             psd_fy0 = xp.sum(is_hf_fy0.astype(xp.float64) * Fp_fy0_3d * psd_fy0_3d, axis=0) * sinc2_temporal
             
-            # (0,0) case - vectorized: k != 0 AND l != 0
-            kl_00 = [(k, l) for k in range(-n_alias, n_alias + 1) 
-                     for l in range(-n_alias, n_alias + 1) if k != 0 and l != 0]
-            k_00 = xp.array([kl[0] for kl in kl_00], dtype=xp.float64)
-            l_00 = xp.array([kl[1] for kl in kl_00], dtype=xp.float64)
+            # (0,0) case using precomputed k_00, l_00 (k != 0 AND l != 0)
+            k_00 = self._alias_k_00
+            l_00 = self._alias_l_00
             f_00_arr = xp.sqrt((k_00 / Lambda)**2 + (l_00 / Lambda)**2)
             if self.atmosphere.L0 is not None:
                 psd_00_arr = coeff * xp.power(f_00_arr**2 + L0_inv2, -11/6)
