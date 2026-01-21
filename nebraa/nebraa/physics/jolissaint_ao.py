@@ -795,53 +795,49 @@ class JolissaintAOModel:
             # Main PSD contribution
             psd_layer = prefactor * sinc2_temporal * complex_sum**2
             
-            # Handle axis singularities (simplified for GPU)
+            # Handle axis singularities - VECTORIZED for GPU
             fx_zero = xp.abs(self.FX) < 1e-10
             fy_zero = xp.abs(self.FY) < 1e-10
             
-            # For fx=0: sum over l≠0
-            psd_fx0 = xp.zeros_like(self.F)
-            for l in range(-n_alias, n_alias + 1):
-                if l == 0:
-                    continue
-                fy_al = self.FY - l / Lambda
-                f_al = xp.abs(fy_al)
-                is_hf_l = xp.abs(fy_al) >= f_wfs
-                if self.atmosphere.L0 is not None:
-                    psd_l = coeff * xp.power(f_al**2 + L0_inv2, -11/6)
-                else:
-                    psd_l = coeff * xp.power(xp.maximum(f_al, 1e-12), -11/3)
-                Fp_l = self._piston_lut(f_al)
-                psd_fx0 = psd_fx0 + is_hf_l.astype(xp.float64) * Fp_l * psd_l * sinc2_temporal
+            # Build l_vals for fx=0 case (l != 0): shape (6,)
+            l_vals = xp.array([l for l in range(-n_alias, n_alias + 1) if l != 0], dtype=xp.float64)
+            # Broadcast FY to (6, n_pix, n_pix)
+            FY_3d_l = self.FY[None, :, :]  # (1, n_pix, n_pix)
+            fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda  # (6, n_pix, n_pix)
+            f_al_fx0 = xp.abs(fy_al_3d)
+            is_hf_fx0 = xp.abs(fy_al_3d) >= f_wfs
+            if self.atmosphere.L0 is not None:
+                psd_fx0_3d = coeff * xp.power(f_al_fx0**2 + L0_inv2, -11/6)
+            else:
+                psd_fx0_3d = coeff * xp.power(xp.maximum(f_al_fx0, 1e-12), -11/3)
+            Fp_fx0_3d = self._piston_lut(f_al_fx0)
+            psd_fx0 = xp.sum(is_hf_fx0.astype(xp.float64) * Fp_fx0_3d * psd_fx0_3d, axis=0) * sinc2_temporal
             
-            # For fy=0: sum over k≠0
-            psd_fy0 = xp.zeros_like(self.F)
-            for k in range(-n_alias, n_alias + 1):
-                if k == 0:
-                    continue
-                fx_al = self.FX - k / Lambda
-                f_al = xp.abs(fx_al)
-                is_hf_k = xp.abs(fx_al) >= f_wfs
-                if self.atmosphere.L0 is not None:
-                    psd_k = coeff * xp.power(f_al**2 + L0_inv2, -11/6)
-                else:
-                    psd_k = coeff * xp.power(xp.maximum(f_al, 1e-12), -11/3)
-                Fp_k = self._piston_lut(f_al)
-                psd_fy0 = psd_fy0 + is_hf_k.astype(xp.float64) * Fp_k * psd_k * sinc2_temporal
+            # Build k_vals for fy=0 case (k != 0): shape (6,)
+            k_vals = xp.array([k for k in range(-n_alias, n_alias + 1) if k != 0], dtype=xp.float64)
+            FX_3d_k = self.FX[None, :, :]
+            fx_al_3d = FX_3d_k - k_vals[:, None, None] / Lambda
+            f_al_fy0 = xp.abs(fx_al_3d)
+            is_hf_fy0 = xp.abs(fx_al_3d) >= f_wfs
+            if self.atmosphere.L0 is not None:
+                psd_fy0_3d = coeff * xp.power(f_al_fy0**2 + L0_inv2, -11/6)
+            else:
+                psd_fy0_3d = coeff * xp.power(xp.maximum(f_al_fy0, 1e-12), -11/3)
+            Fp_fy0_3d = self._piston_lut(f_al_fy0)
+            psd_fy0 = xp.sum(is_hf_fy0.astype(xp.float64) * Fp_fy0_3d * psd_fy0_3d, axis=0) * sinc2_temporal
             
-            # (0,0) case
-            psd_00 = 0.0
-            for k in range(-n_alias, n_alias + 1):
-                for l in range(-n_alias, n_alias + 1):
-                    if k == 0 or l == 0:
-                        continue
-                    f_00 = math.sqrt((k/Lambda)**2 + (l/Lambda)**2)
-                    if self.atmosphere.L0 is not None:
-                        psd_kl = coeff * (f_00**2 + L0_inv2) ** (-11/6)
-                    else:
-                        psd_kl = coeff * f_00 ** (-11/3)
-                    Fp_kl = float(self._piston_lut(xp.array([f_00]))[0])
-                    psd_00 += Fp_kl * psd_kl
+            # (0,0) case - vectorized: k != 0 AND l != 0
+            kl_00 = [(k, l) for k in range(-n_alias, n_alias + 1) 
+                     for l in range(-n_alias, n_alias + 1) if k != 0 and l != 0]
+            k_00 = xp.array([kl[0] for kl in kl_00], dtype=xp.float64)
+            l_00 = xp.array([kl[1] for kl in kl_00], dtype=xp.float64)
+            f_00_arr = xp.sqrt((k_00 / Lambda)**2 + (l_00 / Lambda)**2)
+            if self.atmosphere.L0 is not None:
+                psd_00_arr = coeff * xp.power(f_00_arr**2 + L0_inv2, -11/6)
+            else:
+                psd_00_arr = coeff * xp.power(f_00_arr, -11/3)
+            Fp_00_arr = self._piston_lut(f_00_arr)
+            psd_00 = xp.sum(Fp_00_arr * psd_00_arr)
             
             # Combine
             both_zero = fx_zero & fy_zero

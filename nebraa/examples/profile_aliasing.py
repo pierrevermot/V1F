@@ -347,10 +347,60 @@ def profile_vectorized(model, n_runs=3, sync_gpu=False):
                 cp.cuda.Stream.null.synchronize()
             timings['main_psd'].append(time.perf_counter() - t0)
             
-            # Axis singularities
+            # Axis singularities - FULL VECTORIZED computation
             t0 = time.perf_counter()
             fx_zero = xp.abs(model.FX) < 1e-10
             fy_zero = xp.abs(model.FY) < 1e-10
+            
+            L0 = model.atmosphere.L0
+            L0_inv2 = 1.0 / L0**2 if L0 else 0
+            coeff = 0.023 * (r0_sci ** (-5/3))
+            
+            # fx=0 case: vectorized over l != 0
+            l_vals = xp.array([l for l in range(-n_alias, n_alias + 1) if l != 0], dtype=xp.float64)
+            FY_3d_l = model.FY[None, :, :]
+            fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda
+            f_al_fx0 = xp.abs(fy_al_3d)
+            is_hf_fx0 = xp.abs(fy_al_3d) >= f_wfs
+            if L0 is not None:
+                psd_fx0_3d = coeff * xp.power(f_al_fx0**2 + L0_inv2, -11/6)
+            else:
+                psd_fx0_3d = coeff * xp.power(xp.maximum(f_al_fx0, 1e-12), -11/3)
+            Fp_fx0_3d = model._piston_lut(f_al_fx0)
+            psd_fx0 = xp.sum(is_hf_fx0.astype(xp.float64) * Fp_fx0_3d * psd_fx0_3d, axis=0) * sinc2_temporal
+            
+            # fy=0 case: vectorized over k != 0
+            k_vals = xp.array([k for k in range(-n_alias, n_alias + 1) if k != 0], dtype=xp.float64)
+            FX_3d_k = model.FX[None, :, :]
+            fx_al_3d = FX_3d_k - k_vals[:, None, None] / Lambda
+            f_al_fy0 = xp.abs(fx_al_3d)
+            is_hf_fy0 = xp.abs(fx_al_3d) >= f_wfs
+            if L0 is not None:
+                psd_fy0_3d = coeff * xp.power(f_al_fy0**2 + L0_inv2, -11/6)
+            else:
+                psd_fy0_3d = coeff * xp.power(xp.maximum(f_al_fy0, 1e-12), -11/3)
+            Fp_fy0_3d = model._piston_lut(f_al_fy0)
+            psd_fy0 = xp.sum(is_hf_fy0.astype(xp.float64) * Fp_fy0_3d * psd_fy0_3d, axis=0) * sinc2_temporal
+            
+            # (0,0) case: vectorized
+            kl_00 = [(k, l) for k in range(-n_alias, n_alias + 1)
+                     for l in range(-n_alias, n_alias + 1) if k != 0 and l != 0]
+            k_00 = xp.array([kl[0] for kl in kl_00], dtype=xp.float64)
+            l_00 = xp.array([kl[1] for kl in kl_00], dtype=xp.float64)
+            f_00_arr = xp.sqrt((k_00 / Lambda)**2 + (l_00 / Lambda)**2)
+            if L0 is not None:
+                psd_00_arr = coeff * xp.power(f_00_arr**2 + L0_inv2, -11/6)
+            else:
+                psd_00_arr = coeff * xp.power(f_00_arr, -11/3)
+            Fp_00_arr = model._piston_lut(f_00_arr)
+            psd_00 = xp.sum(Fp_00_arr * psd_00_arr)
+            
+            # Combine
+            both_zero = fx_zero & fy_zero
+            psd_layer = xp.where(both_zero, psd_00, psd_layer)
+            psd_layer = xp.where(fx_zero & ~both_zero, psd_fx0, psd_layer)
+            psd_layer = xp.where(fy_zero & ~both_zero, psd_fy0, psd_layer)
+            
             if sync_gpu and HAS_CUPY:
                 cp.cuda.Stream.null.synchronize()
             timings['axis_singularities'].append(time.perf_counter() - t0)
@@ -509,6 +559,51 @@ def main():
         for op, t in sorted_gpu_vec:
             pct = t / results['gpu_vec']['total'] * 100
             print(f"  {op:<25} {t:>8.2f} ms ({pct:>5.1f}%)")
+    
+    # Validation: benchmark actual public method compute_aliasing_psd()
+    print("\n" + "=" * 80)
+    print("VALIDATION: PUBLIC METHOD compute_aliasing_psd()")
+    print("=" * 80)
+    
+    # CPU
+    init_backend('CPU')
+    model_cpu = JolissaintAOModel(n_pix=n_pix, telescope_diameter=D, obstruction_diameter=D_obs,
+                                   wavelength=wavelength, pixel_scale=pixel_scale,
+                                   ao_config=ao_cfg, atmosphere=atm)
+    _ = model_cpu.compute_aliasing_psd()  # warmup
+    times_cpu = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        _ = model_cpu.compute_aliasing_psd()
+        times_cpu.append(time.perf_counter() - t0)
+    cpu_public = np.median(times_cpu) * 1000
+    
+    if HAS_CUPY:
+        # GPU
+        init_backend('GPU')
+        model_gpu2 = JolissaintAOModel(n_pix=n_pix, telescope_diameter=D, obstruction_diameter=D_obs,
+                                        wavelength=wavelength, pixel_scale=pixel_scale,
+                                        ao_config=ao_cfg, atmosphere=atm)
+        for _ in range(3):  # warmup
+            _ = model_gpu2.compute_aliasing_psd()
+            cp.cuda.Stream.null.synchronize()
+        
+        times_gpu = []
+        for _ in range(5):
+            cp.cuda.Stream.null.synchronize()
+            t0 = time.perf_counter()
+            _ = model_gpu2.compute_aliasing_psd()
+            cp.cuda.Stream.null.synchronize()
+            times_gpu.append(time.perf_counter() - t0)
+        gpu_public = np.median(times_gpu) * 1000
+        
+        print(f"\nPublic method compute_aliasing_psd() @ {n_pix}x{n_pix}:")
+        print(f"  CPU (uses loop):       {cpu_public:>8.1f} ms")
+        print(f"  GPU (uses vectorized): {gpu_public:>8.1f} ms")
+        print(f"  Speedup:               {cpu_public/gpu_public:>8.2f}x")
+    else:
+        print(f"\nPublic method compute_aliasing_psd() @ {n_pix}x{n_pix}:")
+        print(f"  CPU (uses loop):       {cpu_public:>8.1f} ms")
 
 
 if __name__ == "__main__":
