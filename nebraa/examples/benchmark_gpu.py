@@ -9,6 +9,7 @@ import time
 import numpy as np
 import cupy as cp
 
+print('NumPy: ', np.__version__)
 print(f'CuPy: {cp.__version__}')
 print(f'Device: {cp.cuda.Device(0).compute_capability}')
 
