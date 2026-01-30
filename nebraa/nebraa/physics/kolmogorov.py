@@ -21,23 +21,28 @@ def kolmogorov_psd(f, r0: float, C: float = 0.023):
     """
     Compute Kolmogorov phase power spectral density.
     
-    W_phi(f) = C * r0^(-5/3) * (2*pi*f)^(-11/3)
+    W_phi(f) = C * r0^(-5/3) * f^(-11/3)
     
     Args:
-        f: Spatial frequency array (cycles/meter)
+        f: Spatial frequency array (cycles/meter, from fftfreq)
         r0: Fried parameter (meters)
         C: Kolmogorov constant (default 0.023)
     
     Returns:
-        Power spectral density values
+        Power spectral density values (rad² per (cycle/m)²)
+        
+    Note:
+        The coefficient 0.023 is for f in cycles/m, integrated as ∫∫ Φ(f) d²f.
+        This is the standard convention for FFT-based phase screen generation.
+        The structure function D_φ(r0) = 6.88 is recovered with this normalization.
     """
     backend = get_backend()
     xp = backend.xp
     
     # Avoid division by zero
-    f = xp.maximum(f, xp.float32(1e-10))
+    f_cyc = xp.maximum(f, xp.float32(1e-10))  # cycles/meter
     
-    return C * (r0 ** (-5/3)) * ((2 * xp.pi * f) ** (-11/3))
+    return C * (r0 ** (-5/3)) * (f_cyc ** (-11/3))
 
 
 # =============================================================================
@@ -247,8 +252,15 @@ class KolmogorovGenerator:
         if pupil is not None:
             pupil = backend.ensure_local(pupil).astype(xp.float32)
             pupil_sum = xp.sum(pupil)
-            mean_phi = xp.sum(phi * pupil[None, :, :], axis=(1, 2)) / pupil_sum
-            phi = (phi - mean_phi[:, None, None]) * pupil[None, :, :]
+            
+            # Check for zero or nearly-zero pupil to avoid divide-by-zero
+            if pupil_sum < 1e-10:
+                # Pupil is essentially empty - no valid pixels to compute piston over
+                # Keep phase as-is but mask with pupil (all zeros)
+                phi = phi * pupil[None, :, :]
+            else:
+                mean_phi = xp.sum(phi * pupil[None, :, :], axis=(1, 2)) / pupil_sum
+                phi = (phi - mean_phi[:, None, None]) * pupil[None, :, :]
         
         return phi
 
@@ -385,9 +397,13 @@ class AtmosphereModel:
             Phi = xp.fft.fft2(phase_rad)
             phase_rad = xp.real(xp.fft.ifft2(Phi * LP[None, :, :])).astype(xp.float32)
             
-            # Remove filtering-induced piston
-            mean = xp.sum(phase_rad * pupil_local[None, :, :], axis=(1, 2)) / pupil_sum
-            phase_rad = (phase_rad - mean[:, None, None]) * pupil_local[None, :, :]
+            # Remove filtering-induced piston (check for zero pupil)
+            if pupil_sum < 1e-10:
+                # Pupil is essentially empty - no valid pixels to compute piston over
+                phase_rad = phase_rad * pupil_local[None, :, :]
+            else:
+                mean = xp.sum(phase_rad * pupil_local[None, :, :], axis=(1, 2)) / pupil_sum
+                phase_rad = (phase_rad - mean[:, None, None]) * pupil_local[None, :, :]
             
             if single:
                 phase_rad = phase_rad[0]

@@ -1,121 +1,209 @@
 """
 Basic optical propagation and PSF computation.
 
+**LEGACY MODULE**: These functions are maintained for backward compatibility
+but are deprecated in favor of PSFEngine. New code should use PSFEngine directly.
+
 Provides functions for computing point spread functions from pupil
 fields and related optical quantities.
 """
 
 from __future__ import annotations
 
+import warnings
 from typing import Optional, Tuple
 
 from ..utils.compute import get_backend
 
 
 # =============================================================================
-# PSF Computation
+# PSF Computation (Legacy - Use PSFEngine Instead)
 # =============================================================================
 
-def compute_psf(pupil, phase, normalize: bool = True):
+def compute_psf(pupil, phase, normalize: bool = True, normalize_to: str = "peak"):
     """
     Compute PSF from pupil amplitude and phase.
+    
+    **DEPRECATED**: This function is a legacy wrapper around PSFEngine.
+    New code should use PSFEngine directly for better control and consistency.
     
     Args:
         pupil: 2D pupil transmission array
         phase: 2D phase array in radians
-        normalize: If True, normalize to unit peak
+        normalize: If True, normalize PSF (legacy parameter, use normalize_to instead)
+        normalize_to: Normalization mode - 'sum' (energy conservation), 'peak' (peak=1), or 'none'
     
     Returns:
         2D PSF (intensity) array
+    
+    Note:
+        For backward compatibility, normalize=False sets normalize_to='none'.
+        When both are specified, normalize_to takes precedence.
+        
+    Example (migrating to PSFEngine):
+        # Old code:
+        psf = compute_psf(pupil, phase, normalize=True)
+        
+        # New code:
+        from nebraa.physics import PSFEngine
+        engine = PSFEngine(n_pix=pupil.shape[0], wavelength=2.2e-6, pixel_scale=1e-5)
+        psf = engine.compute_psf(pupil, phase, normalize=True)
     """
-    backend = get_backend()
-    xp = backend.xp
+    warnings.warn(
+        "compute_psf() from optics module is deprecated. "
+        "Use PSFEngine.compute_psf() instead for better control and consistency. "
+        "This legacy function will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     
-    pupil = backend.ensure_local(pupil).astype(xp.float32)
-    phase = backend.ensure_local(phase).astype(xp.float32)
+    # Use PSFEngine as backend
+    from .psf_engine import PSFEngine
     
-    # Build complex field
-    E_pupil = pupil * xp.exp(1j * phase)
+    n_pix = pupil.shape[0]
+    # Use default wavelength and pixel_scale (arbitrary but consistent)
+    engine = PSFEngine(n_pix=n_pix, wavelength=2.2e-6, pixel_scale=1e-5)
     
-    # FFT to focal plane
-    E_focal = xp.fft.fftshift(xp.fft.fft2(E_pupil))
+    # Handle legacy normalize parameter
+    if not normalize:
+        normalize_to = "none"
     
-    # Intensity
-    psf = xp.abs(E_focal) ** 2
+    # Map normalize_to to PSFEngine's normalize parameter
+    if normalize_to == "none":
+        do_normalize = False
+    else:
+        do_normalize = True
     
-    if normalize:
-        psf = psf / xp.max(psf)
+    # Compute PSF using PSFEngine
+    psf = engine.compute_psf(pupil, phase, normalize=do_normalize)
     
-    return psf.astype(xp.float32)
+    # PSFEngine always normalizes to sum=1, handle peak normalization
+    if normalize_to == "peak" and do_normalize:
+        backend = get_backend()
+        xp = backend.xp
+        peak = xp.max(psf)
+        if peak > 0:
+            psf = psf / peak
+    
+    return psf
 
 
-def compute_psf_batch(pupil, phase_screens, normalize: bool = True, batch_size: int = 64):
+def compute_psf_batch(pupil, phase_screens, normalize: bool = True, normalize_to: str = "peak", batch_size: int = None):
     """
-    Compute PSFs for multiple phase screens with batching.
+    Compute PSFs for multiple phase screens with vectorized batch processing.
+    
+    **DEPRECATED**: This function is a legacy wrapper around PSFEngine.
+    New code should use PSFEngine.compute_long_exposure_psf() instead.
     
     Args:
         pupil: 2D pupil transmission array
         phase_screens: 3D array (n, H, W) of phase screens in radians
-        normalize: If True, normalize each PSF to unit peak
-        batch_size: Number of PSFs per batch
+        normalize: If True, normalize PSFs (legacy parameter, use normalize_to instead)
+        normalize_to: Normalization mode - 'sum' (energy conservation), 'peak' (peak=1), or 'none'
+        batch_size: Deprecated, kept for API compatibility. Processing is fully vectorized.
     
     Returns:
-        3D array (n, H, W) of PSFs
+        3D array (n, H, W) of PSFs (NOT averaged - returns individual PSFs)
+    
+    Note:
+        For backward compatibility, normalize=False sets normalize_to='none'.
+        When both are specified, normalize_to takes precedence.
+        
+        This function returns INDIVIDUAL PSFs, not the averaged long-exposure PSF.
+        For long-exposure PSF, use PSFEngine.compute_long_exposure_psf() directly.
+        
+    Example (migrating to PSFEngine):
+        # Old code (individual PSFs):
+        psfs = compute_psf_batch(pupil, phases, normalize=True)
+        
+        # New code (individual PSFs):
+        from nebraa.physics import PSFEngine
+        engine = PSFEngine(n_pix=pupil.shape[0], wavelength=2.2e-6, pixel_scale=1e-5)
+        _, psfs = engine.compute_psf_batch(pupil, phases, normalize=True, return_individual=True)
+        
+        # Or for long-exposure PSF (averaged):
+        psf_le = engine.compute_long_exposure_psf(pupil, phases, normalize=True)
     """
-    backend = get_backend()
-    xp = backend.xp
+    warnings.warn(
+        "compute_psf_batch() from optics module is deprecated. "
+        "Use PSFEngine.compute_psf_batch() or PSFEngine.compute_long_exposure_psf() instead. "
+        "This legacy function will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     
-    pupil = backend.ensure_local(pupil).astype(xp.float32)
-    n_psfs = phase_screens.shape[0]
-    n_pix = phase_screens.shape[1]
+    # Use PSFEngine as backend
+    from .psf_engine import PSFEngine
     
-    psfs = xp.zeros((n_psfs, n_pix, n_pix), dtype=xp.float32)
+    n_pix = pupil.shape[0]
+    engine = PSFEngine(n_pix=n_pix, wavelength=2.2e-6, pixel_scale=1e-5)
     
-    for i0 in range(0, n_psfs, batch_size):
-        i1 = min(i0 + batch_size, n_psfs)
-        batch_phase = phase_screens[i0:i1]
-        
-        # Build complex field
-        E_pupil = pupil[None, :, :] * xp.exp(1j * batch_phase)
-        
-        # FFT to focal plane
-        E_focal = xp.fft.fftshift(
-            xp.fft.fft2(E_pupil, axes=(1, 2)),
-            axes=(1, 2)
-        )
-        
-        # Intensity
-        batch_psf = xp.abs(E_focal) ** 2
-        
-        # Normalize
-        if normalize:
-            peak = xp.max(batch_psf, axis=(1, 2), keepdims=True)
-            peak = xp.maximum(peak, xp.float32(1e-30))
-            batch_psf = batch_psf / peak
-        
-        psfs[i0:i1] = batch_psf.astype(xp.float32)
+    # Handle legacy normalize parameter
+    if not normalize:
+        normalize_to = "none"
+    
+    # Map normalize_to to PSFEngine's normalize parameter
+    if normalize_to == "none":
+        do_normalize = False
+    else:
+        do_normalize = True
+    
+    # Compute batch PSFs using PSFEngine (get individual PSFs)
+    _, psfs = engine.compute_psf_batch(
+        pupil, phase_screens, 
+        normalize=do_normalize, 
+        return_individual=True
+    )
+    
+    # PSFEngine normalizes to sum=1, handle peak normalization
+    if normalize_to == "peak" and do_normalize:
+        backend = get_backend()
+        xp = backend.xp
+        peaks = xp.max(psfs, axis=(-2, -1), keepdims=True)
+        peaks = xp.maximum(peaks, xp.float32(1e-30))
+        psfs = psfs / peaks
     
     return psfs
+
 
 
 def compute_reference_psf(pupil):
     """
     Compute diffraction-limited (zero phase) reference PSF.
     
+    **DEPRECATED**: This function is a legacy wrapper around PSFEngine.
+    Use PSFEngine.compute_diffraction_limited_psf() instead.
+    
     Args:
         pupil: 2D pupil transmission array
     
     Returns:
-        2D reference PSF, normalized to unit peak
+        2D reference PSF, normalized to unit sum (not peak!)
+        
+    Example (migrating to PSFEngine):
+        # Old code:
+        ref_psf = compute_reference_psf(pupil)
+        
+        # New code:
+        from nebraa.physics import PSFEngine
+        engine = PSFEngine(n_pix=pupil.shape[0], wavelength=2.2e-6, pixel_scale=1e-5)
+        ref_psf = engine.compute_diffraction_limited_psf(pupil)
     """
-    backend = get_backend()
-    xp = backend.xp
+    warnings.warn(
+        "compute_reference_psf() from optics module is deprecated. "
+        "Use PSFEngine.compute_diffraction_limited_psf() instead. "
+        "This legacy function will be removed in a future version.",
+        DeprecationWarning,
+        stacklevel=2
+    )
     
-    pupil = backend.ensure_local(pupil).astype(xp.float32)
+    from .psf_engine import PSFEngine
+    
     n_pix = pupil.shape[0]
+    engine = PSFEngine(n_pix=n_pix, wavelength=2.2e-6, pixel_scale=1e-5)
     
-    zero_phase = xp.zeros((n_pix, n_pix), dtype=xp.float32)
-    return compute_psf(pupil, zero_phase, normalize=True)
+    # PSFEngine.compute_psf with phase=None returns DL PSF
+    return engine.compute_psf(pupil, phase=None, normalize=True)
 
 
 # =============================================================================

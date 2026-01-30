@@ -25,6 +25,23 @@ from .logging import (
     ProgressTracker,
 )
 
+from .coordinates import (
+    get_grid_center,
+    get_pixel_radius,
+    make_1d_grid,
+    make_xy_grid,
+    make_polar_grid,
+    make_frequency_grid,
+    check_grid_symmetry,
+)
+
+from .rng import (
+    create_rng,
+    get_rng_or_create,
+    check_rng_determinism,
+    get_rng_info,
+)
+
 __all__ = [
     'Backend',
     'init_backend',
@@ -43,4 +60,15 @@ __all__ = [
     'log_once',
     'Timer',
     'ProgressTracker',
+    'get_grid_center',
+    'get_pixel_radius',
+    'make_1d_grid',
+    'make_xy_grid',
+    'make_polar_grid',
+    'make_frequency_grid',
+    'check_grid_symmetry',
+    'create_rng',
+    'get_rng_or_create',
+    'check_rng_determinism',
+    'get_rng_info',
 ]

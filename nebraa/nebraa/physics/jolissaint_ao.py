@@ -32,9 +32,142 @@ from dataclasses import dataclass, field
 import numpy.typing as npt
 
 from ..utils.compute import get_backend
+from .low_wind_effect import LowWindEffect, LowWindEffectConfig
 
 # Type alias for array-like objects (numpy or cupy arrays)
 ArrayLike = Any
+
+
+# =============================================================================
+# Cache Dataclasses for Performance
+# =============================================================================
+
+@dataclass(frozen=True)
+class FFTGrid:
+    """
+    Precomputed FFT frequency grid.
+    
+    Frozen dataclass ensures immutability and enables safe caching.
+    All arrays are computed once in __post_init__.
+    """
+    n_pix: int
+    pupil_pixel_size: float  # meters
+    xp: Any  # numpy or cupy module
+    
+    # These are set in __post_init__
+    FX: ArrayLike = field(init=False, repr=False)
+    FY: ArrayLike = field(init=False, repr=False)
+    F: ArrayLike = field(init=False, repr=False)
+    F2: ArrayLike = field(init=False, repr=False)
+    df: float = field(init=False)
+    dA: float = field(init=False)
+    
+    def __post_init__(self):
+        xp = self.xp
+        n = self.n_pix
+        
+        # Frequency grid (cycles/meter)
+        fx = xp.fft.fftfreq(n, d=self.pupil_pixel_size).astype(xp.float64)
+        fy = xp.fft.fftfreq(n, d=self.pupil_pixel_size).astype(xp.float64)
+        FX, FY = xp.meshgrid(fx, fy, indexing='xy')
+        F2 = FX**2 + FY**2
+        F = xp.sqrt(F2)
+        
+        # Use object.__setattr__ for frozen dataclass
+        object.__setattr__(self, 'FX', FX)
+        object.__setattr__(self, 'FY', FY)
+        object.__setattr__(self, 'F', F)
+        object.__setattr__(self, 'F2', F2)
+        
+        df_val = float(fx[1] - fx[0])
+        object.__setattr__(self, 'df', df_val)
+        object.__setattr__(self, 'dA', df_val**2)
+
+
+@dataclass(frozen=True)
+class AOMasks:
+    """
+    Precomputed AO correction masks and filters.
+    
+    These depend only on system geometry and are computed once.
+    """
+    xp: Any
+    mu_LF: ArrayLike  # Low-frequency (corrected) domain mask
+    mu_HF: ArrayLike  # High-frequency (uncorrected) domain mask  
+    mu_WFS: ArrayLike  # WFS measurement domain mask
+    Fp: ArrayLike  # Piston filter
+    
+    @staticmethod
+    def build(
+        grid: FFTGrid,
+        D: float,
+        f_ao: float,
+        f_wfs: float,
+        mask_geometry: str = 'circular',
+        mask_rolloff: float = 0.0,
+    ) -> 'AOMasks':
+        """
+        Build AO masks from grid and system parameters.
+        
+        Args:
+            grid: FFT frequency grid
+            D: Telescope diameter (meters)
+            f_ao: AO correction cutoff frequency (cycles/meter)
+            f_wfs: WFS measurement cutoff frequency (cycles/meter)
+            mask_geometry: 'circular' or 'square'
+            mask_rolloff: Smooth transition width (0 = hard cutoff)
+        
+        Returns:
+            AOMasks instance
+        """
+        xp = grid.xp
+        
+        # Build LF/WFS masks based on geometry
+        if mask_geometry == 'circular':
+            if mask_rolloff > 0:
+                # Smooth sigmoid roll-off
+                mu_LF = 1.0 / (1.0 + xp.exp((grid.F - f_ao) / mask_rolloff))
+                mu_WFS = 1.0 / (1.0 + xp.exp((grid.F - f_wfs) / mask_rolloff))
+            else:
+                # Hard circular cutoff
+                mu_LF = (grid.F < f_ao).astype(xp.float64)
+                mu_WFS = (grid.F < f_wfs).astype(xp.float64)
+        else:  # square
+            if mask_rolloff > 0:
+                # Smooth square mask
+                mask_x_ao = 1.0 / (1.0 + xp.exp((xp.abs(grid.FX) - f_ao) / mask_rolloff))
+                mask_y_ao = 1.0 / (1.0 + xp.exp((xp.abs(grid.FY) - f_ao) / mask_rolloff))
+                mu_LF = mask_x_ao * mask_y_ao
+                
+                mask_x_wfs = 1.0 / (1.0 + xp.exp((xp.abs(grid.FX) - f_wfs) / mask_rolloff))
+                mask_y_wfs = 1.0 / (1.0 + xp.exp((xp.abs(grid.FY) - f_wfs) / mask_rolloff))
+                mu_WFS = mask_x_wfs * mask_y_wfs
+            else:
+                # Hard square cutoff
+                mu_LF = ((xp.abs(grid.FX) < f_ao) & (xp.abs(grid.FY) < f_ao)).astype(xp.float64)
+                mu_WFS = ((xp.abs(grid.FX) < f_wfs) & (xp.abs(grid.FY) < f_wfs)).astype(xp.float64)
+        
+        # High-frequency mask
+        mu_HF = 1.0 - mu_LF
+        
+        # Piston filter
+        Fp = piston_filter(xp, grid.F, D)
+        
+        return AOMasks(xp=xp, mu_LF=mu_LF, mu_HF=mu_HF, mu_WFS=mu_WFS, Fp=Fp)
+
+
+@dataclass(frozen=True)
+class LayerCache:
+    """
+    Precomputed per-layer turbulence PSD and layer properties.
+    
+    This eliminates redundant Von Kármán PSD evaluations.
+    """
+    psd_phi: ArrayLike  # Φ_i(fx, fy) on full grid
+    r0_sci: float  # r0 at science wavelength
+    vx: float  # Wind velocity x-component
+    vy: float  # Wind velocity y-component
+    h: float  # Layer altitude
 
 
 # =============================================================================
@@ -73,23 +206,64 @@ class AtmosphereProfile:
     """
     Multi-layer atmospheric turbulence profile.
     
+    Supports two modes:
+    1. Explicit per-layer r0: Each layer has its own r0 value
+    2. Total r0 + Cn2 fractions: Layers have Cn2_fraction, r0 computed from total
+    
     Attributes:
         layers: List of TurbulentLayer objects
         wavelength_ref: Reference wavelength for r0 values (meters)
         L0: Outer scale of turbulence (meters), None for Kolmogorov
         l0: Inner scale of turbulence (meters), default 0
+        total_r0: Optional total r0 at reference wavelength (meters).
+                  If provided, per-layer r0 values are computed from Cn2_fraction.
     """
     layers: List[TurbulentLayer]
     wavelength_ref: float = 0.5e-6
     L0: Optional[float] = 25.0
     l0: float = 0.0
+    total_r0: Optional[float] = None
+    
+    def __post_init__(self):
+        """
+        If total_r0 is provided, compute per-layer r0 from Cn2_fraction.
+        
+        Uses: r0_i = r0_total * fraction_i^(-3/5)
+        because r0^(-5/3) is linear in turbulence strength.
+        """
+        if self.total_r0 is not None:
+            # Validate that Cn2_fractions sum to 1
+            total_frac = sum(layer.Cn2_fraction for layer in self.layers)
+            if not (0.99 < total_frac < 1.01):
+                raise ValueError(
+                    f"Cn2_fractions must sum to 1.0, got {total_frac:.4f}. "
+                    "Either normalize fractions or provide explicit r0 per layer."
+                )
+            
+            # Compute per-layer r0 from total_r0 and fractions
+            # r0_i^(-5/3) = fraction_i * r0_total^(-5/3)
+            # => r0_i = r0_total * fraction_i^(-3/5)
+            r0_total_inv_53 = self.total_r0 ** (-5/3)
+            for layer in self.layers:
+                # Update layer r0 based on fraction (TurbulentLayer is not frozen)
+                layer.r0 = (layer.Cn2_fraction * r0_total_inv_53) ** (-3/5)
     
     @property
-    def r0_total(self) -> float:
-        """Compute total Fried parameter from all layers."""
+    def r0_total_computed(self) -> float:
+        """Compute total Fried parameter from per-layer r0 values."""
         # r0_total^(-5/3) = sum(r0_i^(-5/3))
         r0_inv_53 = sum(layer.r0 ** (-5/3) for layer in self.layers)
         return r0_inv_53 ** (-3/5)
+    
+    @property
+    def r0_effective(self) -> float:
+        """Return total r0 (provided or computed from layers)."""
+        return self.total_r0 if self.total_r0 is not None else self.r0_total_computed
+    
+    @property
+    def r0_total(self) -> float:
+        """Backward compatibility alias for r0_effective."""
+        return self.r0_effective
     
     @property
     def mean_altitude(self) -> float:
@@ -222,56 +396,70 @@ class AOSystemConfig:
 # Turbulent Phase Power Spectrum Models
 # =============================================================================
 
-def kolmogorov_psd(f, r0: float):
+def kolmogorov_psd(xp, f, r0: float):
     """
     Kolmogorov phase power spectral density. [Eq. 19]
     
     Φ(f) = 0.023 * r0^(-5/3) * f^(-11/3)
     
+    where f is spatial frequency in cycles/meter.
+    
     Args:
-        f: Spatial frequency magnitude (cycles/meter)
+        xp: Backend module (numpy or cupy)
+        f: Spatial frequency magnitude (cycles/meter, from fftfreq)
         r0: Fried parameter (meters)
     
     Returns:
         Power spectral density (rad^2 per (cycles/m)^2)
+        
+    Note:
+        The coefficient 0.023 is for f in cycles/m, integrated as ∫∫ Φ(f) d²f.
+        This is the standard convention for FFT-based phase screen generation.
+        The structure function D_φ(r0) = 6.88 is recovered with this normalization.
     """
-    backend = get_backend()
-    xp = backend.xp
-    
     # Avoid division by zero
     f = xp.maximum(xp.asarray(f), xp.float64(1e-12))
     
     return 0.023 * (r0 ** (-5/3)) * (f ** (-11/3))
 
 
-def von_karman_psd(f, r0: float, L0: float):
+def von_karman_psd(xp, f, r0: float, L0: float):
     """
     Von Karman phase power spectral density (with outer scale).
     
-    Φ(f) = 0.023 * r0^(-5/3) * (f^2 + 1/L0^2)^(-11/6)
+    Φ(f) = 0.023 * r0^(-5/3) * (f^2 + f0^2)^(-11/6)
+    
+    where f is spatial frequency in cycles/meter and f0 = 1/L0.
     
     Args:
-        f: Spatial frequency magnitude (cycles/meter)
+        xp: Backend module (numpy or cupy)
+        f: Spatial frequency magnitude (cycles/meter, from fftfreq)
         r0: Fried parameter (meters)
         L0: Outer scale (meters)
     
     Returns:
-        Power spectral density
+        Power spectral density (rad^2 per (cycles/m)^2)
+        
+    Note:
+        The coefficient 0.023 is for f in cycles/m, integrated as ∫∫ Φ(f) d²f.
+        The outer scale cutoff frequency is f0 = 1/L0 in cycles/m.
     """
-    backend = get_backend()
-    xp = backend.xp
-    
     f = xp.asarray(f)
-    return 0.023 * (r0 ** (-5/3)) * ((f**2 + 1.0/L0**2) ** (-11/6))
+    
+    # Outer scale cutoff frequency in cycles/m
+    f0 = 1.0 / L0
+    
+    return 0.023 * (r0 ** (-5/3)) * ((f**2 + f0**2) ** (-11/6))
 
 
-def piston_filter(f, D: float):
+def piston_filter(xp, f, D: float):
     """
     Piston filter for removing piston mode from phase PS. [Eq. 21]
     
     F_p(f) = 1 - (2*J1(π*D*f)/(π*D*f))^2
     
     Args:
+        xp: Backend module (numpy or cupy)
         f: Spatial frequency magnitude (cycles/meter)
         D: Telescope diameter (meters)
     
@@ -281,8 +469,6 @@ def piston_filter(f, D: float):
     Raises:
         RuntimeError: If required Bessel function library is not available
     """
-    backend = get_backend()
-    xp = backend.xp
     
     f = xp.asarray(f, dtype=xp.float64)
     
@@ -295,14 +481,14 @@ def piston_filter(f, D: float):
     # Compute J1 accurately for the active backend
     j1_vals = None
     
-    # CuPy path
+    # CuPy path - require cupyx.scipy.special.j1
     try:
         import cupy  # type: ignore
         if xp is cupy:
             try:
                 from cupyx.scipy.special import j1 as cupy_j1  # type: ignore
                 j1_vals = cupy_j1(x)
-            except Exception as e:
+            except ImportError as e:
                 raise RuntimeError(
                     "cupyx.scipy.special.j1 required for piston_filter on CuPy backend. "
                     "Install with: pip install cupy-cuda11x (or appropriate CUDA version)"
@@ -310,7 +496,7 @@ def piston_filter(f, D: float):
     except ImportError:
         pass
     
-    # NumPy path
+    # NumPy path (only reached if xp is not cupy)
     if j1_vals is None:
         try:
             from scipy.special import j1 as scipy_j1
@@ -319,8 +505,8 @@ def piston_filter(f, D: float):
                 "scipy.special.j1 required for piston_filter. "
                 "Install with: pip install scipy"
             ) from e
-        x_np = backend.to_numpy(x)
-        j1_vals = xp.asarray(scipy_j1(x_np), dtype=xp.float64)
+        # x is guaranteed to be a numpy array here since xp is not cupy
+        j1_vals = xp.asarray(scipy_j1(x), dtype=xp.float64)
     
     # Piston filter: Fp = 1 - (2*J1(x)/x)^2
     term = 2.0 * j1_vals / x
@@ -372,18 +558,29 @@ class PistonFilterLUT:
         # Cache for GPU-side LUT to avoid repeated CPU->GPU transfers
         self._gpu_lut_cache = None
     
-    def __call__(self, f) -> ArrayLike:
+    def __call__(self, f, xp=None) -> ArrayLike:
         """
         Evaluate piston filter at frequencies f using LUT interpolation.
         
         Args:
             f: Spatial frequency magnitude (cycles/meter)
+            xp: Array module (numpy or cupy). If None, inferred from f.
         
         Returns:
             Piston filter values F_p(f)
         """
-        backend = get_backend()
-        xp = backend.xp
+        import numpy as np
+        
+        # Infer xp from input array if not provided
+        if xp is None:
+            try:
+                import cupy
+                if hasattr(f, '__cuda_array_interface__'):
+                    xp = cupy
+                else:
+                    xp = np
+            except ImportError:
+                xp = np
         
         f = xp.asarray(f, dtype=xp.float64)
         x = xp.pi * self.D * xp.abs(f)
@@ -396,7 +593,8 @@ class PistonFilterLUT:
         frac = (x / self.dx) - idx
         
         # Use cached GPU array to avoid repeated CPU->GPU transfers
-        if backend.gpu:
+        is_gpu = xp.__name__ == 'cupy'
+        if is_gpu:
             if self._gpu_lut_cache is None:
                 self._gpu_lut_cache = xp.asarray(self.j1_over_x_lut)
             j1_over_x_lut = self._gpu_lut_cache
@@ -442,6 +640,7 @@ class JolissaintAOModel:
         pixel_scale: float,
         atmosphere: AtmosphereProfile,
         ao_config: AOSystemConfig,
+        lwe_config: Optional[LowWindEffectConfig] = None,
     ):
         """
         Initialize the Jolissaint AO model.
@@ -454,9 +653,13 @@ class JolissaintAOModel:
             pixel_scale: Focal plane pixel scale (radians/pixel)
             atmosphere: Atmospheric turbulence profile
             ao_config: AO system configuration
+            lwe_config: Optional Low Wind Effect configuration. If provided,
+                       LWE will be included in long-exposure PSF computation.
         """
-        backend = get_backend()
-        xp = backend.xp
+        # Cache backend reference ONCE at init to avoid repeated get_backend() calls
+        self._backend = get_backend()
+        self._xp = self._backend.xp
+        xp = self._xp
         
         self.n_pix = n_pix
         self.D = telescope_diameter
@@ -465,6 +668,10 @@ class JolissaintAOModel:
         self.pixel_scale = pixel_scale
         self.atmosphere = atmosphere
         self.ao_config = ao_config
+        self.lwe_config = lwe_config
+        
+        # LWE model (lazily initialized on first use)
+        self._lwe_model = None
         
         # Pupil plane pixel size
         self.pupil_pixel_size = wavelength / (n_pix * pixel_scale)
@@ -472,95 +679,75 @@ class JolissaintAOModel:
         # Physical pupil extent
         self.pupil_extent = n_pix * self.pupil_pixel_size
         
-        # Setup frequency grids
-        self._setup_frequency_grid()
+        # Build immutable caches for performance (NEW APPROACH)
+        self.grid = FFTGrid(n_pix, self.pupil_pixel_size, xp)
+        self.masks = AOMasks.build(
+            self.grid, self.D,
+            self.ao_config.f_ao,
+            self.ao_config.f_wfs,
+            self.ao_config.mask_geometry,
+            self.ao_config.mask_rolloff,
+        )
+        self.layer_cache = self._build_layer_cache()
         
-        # Precompute masks and filters
-        self._setup_masks()
+        # Keep old attributes for backward compatibility
+        self.FX = self.grid.FX
+        self.FY = self.grid.FY
+        self.F = self.grid.F
+        self.df = self.grid.df
+        self.dA = self.grid.dA
+        self.mu_LF = self.masks.mu_LF
+        self.mu_HF = self.masks.mu_HF
+        self.mu_WFS = self.masks.mu_WFS
+        self.Fp = self.masks.Fp
+        
+        # Piston filter LUT for fast aliasing computation
+        f_max_grid = float(self._backend.to_numpy(xp.max(self.grid.F)))
+        f_max_lut = f_max_grid + 5.0 / self.ao_config.wfs_subaperture_size
+        self._piston_lut = PistonFilterLUT(self.D, f_max=f_max_lut, n_points=20000)
         
         # Precompute aliasing index arrays for vectorized computation
         self._precompute_aliasing_arrays()
-        
-        # Cache backend reference to avoid repeated get_backend() calls
-        self._backend = get_backend()
-        self._xp = self._backend.xp
     
-    def _setup_frequency_grid(self):
-        """Setup spatial frequency grid in pupil plane."""
-        backend = get_backend()
-        xp = backend.xp
+    def _build_layer_cache(self) -> Tuple[LayerCache, ...]:
+        """
+        Build per-layer PSD cache to avoid redundant computations.
         
-        n = self.n_pix
+        Returns:
+            Tuple of LayerCache objects, one per atmospheric layer.
+        """
+        xp = self._xp
+        caches = []
         
-        # Frequency grid (cycles/meter)
-        # Using fftfreq convention for consistency with FFT operations
-        df = 1.0 / self.pupil_extent
-        fx = xp.fft.fftfreq(n, d=self.pupil_pixel_size).astype(xp.float64)
-        fy = xp.fft.fftfreq(n, d=self.pupil_pixel_size).astype(xp.float64)
-        self.FX, self.FY = xp.meshgrid(fx, fy)
+        for layer in self.atmosphere.layers:
+            # Scale r0 to science wavelength
+            r0_sci = layer.r0 * (self.wavelength / self.atmosphere.wavelength_ref) ** (6/5)
+            
+            # Compute PSD for this layer on full grid
+            if self.atmosphere.L0 is not None:
+                psd_phi = von_karman_psd(xp, self.grid.F, r0_sci, self.atmosphere.L0)
+            else:
+                psd_phi = kolmogorov_psd(xp, self.grid.F, r0_sci)
+            
+            # Extract wind components
+            vx, vy = layer.wind_velocity
+            
+            caches.append(LayerCache(
+                psd_phi=psd_phi,
+                r0_sci=r0_sci,
+                vx=vx,
+                vy=vy,
+                h=layer.altitude,
+            ))
         
-        # Frequency magnitude
-        self.F = xp.sqrt(self.FX**2 + self.FY**2)
-        
-        # Area element for integration
-        self.df = df
-        self.dA = df**2
+        return tuple(caches)
     
-    def _setup_masks(self):
-        """Setup LF/HF masks and filters."""
-        backend = get_backend()
-        xp = backend.xp
-        
-        f_ao = self.ao_config.f_ao
-        f_wfs = self.ao_config.f_wfs
-        geometry = self.ao_config.mask_geometry
-        rolloff = self.ao_config.mask_rolloff
-        
-        # Build masks based on geometry and rolloff settings
-        if geometry == 'circular':
-            # Circular (radial) support - realistic for modal control
-            if rolloff > 0:
-                # Smooth sigmoid roll-off: 1/(1 + exp((F - f0)/delta))
-                # This models the gradual cutoff of modal reconstructors
-                self.mu_LF = 1.0 / (1.0 + xp.exp((self.F - f_ao) / rolloff))
-                self.mu_WFS = 1.0 / (1.0 + xp.exp((self.F - f_wfs) / rolloff))
-            else:
-                # Hard circular cutoff
-                self.mu_LF = (self.F < f_ao).astype(xp.float64)
-                self.mu_WFS = (self.F < f_wfs).astype(xp.float64)
-        else:
-            # Square support - Jolissaint paper convention for SH-WFS
-            # [Section 4.C: "the LF domain is defined by |fx|,|fy| < f_ao (a square)"]
-            if rolloff > 0:
-                # Smooth square mask using product of sigmoids on each axis
-                mask_x_ao = 1.0 / (1.0 + xp.exp((xp.abs(self.FX) - f_ao) / rolloff))
-                mask_y_ao = 1.0 / (1.0 + xp.exp((xp.abs(self.FY) - f_ao) / rolloff))
-                self.mu_LF = mask_x_ao * mask_y_ao
-                
-                mask_x_wfs = 1.0 / (1.0 + xp.exp((xp.abs(self.FX) - f_wfs) / rolloff))
-                mask_y_wfs = 1.0 / (1.0 + xp.exp((xp.abs(self.FY) - f_wfs) / rolloff))
-                self.mu_WFS = mask_x_wfs * mask_y_wfs
-            else:
-                # Hard square cutoff
-                self.mu_LF = ((xp.abs(self.FX) < f_ao) & (xp.abs(self.FY) < f_ao)).astype(xp.float64)
-                self.mu_WFS = ((xp.abs(self.FX) < f_wfs) & (xp.abs(self.FY) < f_wfs)).astype(xp.float64)
-        
-        # High-frequency mask (DM) - complement of LF mask
-        self.mu_HF = 1.0 - self.mu_LF
-        
-        # Piston filter (for fitting PSD etc.)
-        self.Fp = piston_filter(self.F, self.D)
-        
-        # Piston filter LUT for fast aliasing computation
-        # Estimate max frequency needed: f_max ~ n_alias / Lambda + max(|F|)
-        f_max_grid = float(backend.to_numpy(xp.max(self.F)))
-        f_max_lut = f_max_grid + 5.0 / self.ao_config.wfs_subaperture_size
-        self._piston_lut = PistonFilterLUT(self.D, f_max=f_max_lut, n_points=20000)
+    # NOTE: _setup_frequency_grid() and _setup_masks() have been removed.
+    # Use FFTGrid and AOMasks frozen dataclasses instead (self.grid, self.masks).
     
     def _precompute_aliasing_arrays(self):
         """Precompute index arrays used in vectorized aliasing computation."""
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         n_alias = 3
         
         # (k,l) pairs excluding (0,0) for main aliasing sum
@@ -582,25 +769,6 @@ class JolissaintAOModel:
         self._alias_k_00 = xp.array([kl[0] for kl in kl_00], dtype=xp.float64)
         self._alias_l_00 = xp.array([kl[1] for kl in kl_00], dtype=xp.float64)
     
-    def _turbulent_psd_layer(self, layer: TurbulentLayer) -> ArrayLike:
-        """
-        Compute turbulent phase PSD for a single layer at science wavelength.
-        
-        Uses Kolmogorov or Von Karman model depending on outer scale.
-        """
-        backend = get_backend()
-        xp = backend.xp
-        
-        # Scale r0 to science wavelength
-        r0_sci = layer.r0 * (self.wavelength / self.atmosphere.wavelength_ref) ** (6/5)
-        
-        if self.atmosphere.L0 is not None:
-            psd = von_karman_psd(self.F, r0_sci, self.atmosphere.L0)
-        else:
-            psd = kolmogorov_psd(self.F, r0_sci)
-        
-        return psd
-    
     def compute_fitting_psd(self) -> ArrayLike:
         """
         Compute fitting error PSD. [Eq. 22]
@@ -609,17 +777,15 @@ class JolissaintAOModel:
         
         Φ_fit(f) = μ_HF(f) * F_p(f) * Φ_turb(f)
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         if not self.ao_config.include_fitting:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
-        # Sum over all layers
-        psd_fit = xp.zeros_like(self.F)
-        for layer in self.atmosphere.layers:
-            psd_layer = self._turbulent_psd_layer(layer)
-            psd_fit = psd_fit + self.mu_HF * self.Fp * psd_layer
+        # Sum over all layers using precomputed PSDs
+        psd_fit = xp.zeros_like(self.grid.F)
+        for lc in self.layer_cache:
+            psd_fit = psd_fit + self.masks.mu_HF * self.masks.Fp * lc.psd_phi
         
         return psd_fit
     
@@ -634,26 +800,18 @@ class JolissaintAOModel:
         
         where θ is the angular separation between science target and NGS.
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         if not self.ao_config.include_anisoplanatism or self.ao_config.science_field_offset == 0:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
         theta_x, theta_y = self.ao_config.field_offset
         
-        psd_aniso = xp.zeros_like(self.F)
-        for layer in self.atmosphere.layers:
-            psd_layer = self._turbulent_psd_layer(layer)
-            h = layer.altitude
-            
-            # Phase term: 2πh(f·θ) = 2π*h*(fx*θx + fy*θy)
-            phase_term = 2.0 * xp.pi * h * (self.FX * theta_x + self.FY * theta_y)
-            
-            # 1 - cos(phase) factor gives the decorrelation
-            decorr = 1.0 - xp.cos(phase_term)
-            
-            psd_aniso = psd_aniso + 2.0 * self.mu_LF * self.Fp * psd_layer * decorr
+        psd_aniso = xp.zeros_like(self.grid.F)
+        for lc in self.layer_cache:
+            # Phase term: 2π * h * (fx*θx + fy*θy)
+            phase = 2.0 * xp.pi * lc.h * (self.grid.FX * theta_x + self.grid.FY * theta_y)
+            psd_aniso = psd_aniso + 2.0 * self.masks.mu_LF * self.masks.Fp * lc.psd_phi * (1.0 - xp.cos(phase))
         
         return psd_aniso
     
@@ -666,35 +824,27 @@ class JolissaintAOModel:
         Φ_servo(f) = μ_LF(f) * F_p(f) * Σ_n Φ_n(f) * 
                      {1 - 2*cos(2π*t_l*f·v_n)*sinc(Δt*f·v_n) + sinc²(Δt*f·v_n)}
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         if not self.ao_config.include_servo_lag:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
         dt = self.ao_config.integration_time
         tl = self.ao_config.total_delay
         
-        psd_servo = xp.zeros_like(self.F)
-        for layer in self.atmosphere.layers:
-            psd_layer = self._turbulent_psd_layer(layer)
-            vx, vy = layer.wind_velocity
-            
+        psd_servo = xp.zeros_like(self.grid.F)
+        for lc in self.layer_cache:
             # f·v = fx*vx + fy*vy
-            f_dot_v = self.FX * vx + self.FY * vy
+            f_dot_v = self.grid.FX * lc.vx + self.grid.FY * lc.vy
             
-            # Arguments for sinc and cos
-            sinc_arg = dt * f_dot_v  # sinc(Δt * f·v)
-            cos_arg = 2.0 * xp.pi * tl * f_dot_v  # 2π * t_l * f·v
-            
-            # sinc function: sinc(x) = sin(πx)/(πx)
-            # Handle x=0 case
-            sinc_val = xp.sinc(sinc_arg)  # numpy's sinc includes the π factor
+            # sinc and cos arguments
+            sinc_val = xp.sinc(dt * f_dot_v)
+            cos_arg = 2.0 * xp.pi * tl * f_dot_v
             
             # Error factor: {1 - 2*cos(...)*sinc(...) + sinc²(...)}
             error_factor = 1.0 - 2.0 * xp.cos(cos_arg) * sinc_val + sinc_val**2
             
-            psd_servo = psd_servo + self.mu_LF * self.Fp * psd_layer * error_factor
+            psd_servo = psd_servo + self.masks.mu_LF * self.masks.Fp * lc.psd_phi * error_factor
         
         return psd_servo
     
@@ -709,35 +859,41 @@ class JolissaintAOModel:
                    {1 - 2*cos(2π*f·[h_n*θ - t_l*v_n])*sinc(Δt*f·v_n) + sinc²(Δt*f·v_n)}
         
         where θ is the science field angle relative to NGS.
+        
+        Note: This method should only be called when BOTH anisoplanatism and
+        servo-lag are enabled. For individual terms, use compute_anisoplanatism_psd()
+        or compute_servo_lag_psd().
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         # If both are disabled, return zero
         if not self.ao_config.include_anisoplanatism and not self.ao_config.include_servo_lag:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
+        # If only one is enabled, fall back to separate terms
+        # (The combined equation requires both effects to be present)
+        if not self.ao_config.include_anisoplanatism:
+            return self.compute_servo_lag_psd()
+        if not self.ao_config.include_servo_lag:
+            return self.compute_anisoplanatism_psd()
+        
+        # Both are enabled: compute combined term
         dt = self.ao_config.integration_time
         tl = self.ao_config.total_delay
         theta_x, theta_y = self.ao_config.field_offset
         
-        psd_as = xp.zeros_like(self.F)
-        for layer in self.atmosphere.layers:
-            psd_layer = self._turbulent_psd_layer(layer)
-            h = layer.altitude
-            vx, vy = layer.wind_velocity
-            
+        psd_as = xp.zeros_like(self.grid.F)
+        for lc in self.layer_cache:
             # Combined offset: h*θ - t_l*v
-            offset_x = h * theta_x - tl * vx
-            offset_y = h * theta_y - tl * vy
+            offset_x = lc.h * theta_x - tl * lc.vx
+            offset_y = lc.h * theta_y - tl * lc.vy
             
             # f·offset = fx*offset_x + fy*offset_y
-            f_dot_offset = self.FX * offset_x + self.FY * offset_y
+            f_dot_offset = self.grid.FX * offset_x + self.grid.FY * offset_y
             
             # f·v for sinc
-            f_dot_v = self.FX * vx + self.FY * vy
-            sinc_arg = dt * f_dot_v
-            sinc_val = xp.sinc(sinc_arg)
+            f_dot_v = self.grid.FX * lc.vx + self.grid.FY * lc.vy
+            sinc_val = xp.sinc(dt * f_dot_v)
             
             # cos argument
             cos_arg = 2.0 * xp.pi * f_dot_offset
@@ -745,7 +901,7 @@ class JolissaintAOModel:
             # Error factor
             error_factor = 1.0 - 2.0 * xp.cos(cos_arg) * sinc_val + sinc_val**2
             
-            psd_as = psd_as + self.mu_LF * self.Fp * psd_layer * error_factor
+            psd_as = psd_as + self.masks.mu_LF * self.masks.Fp * lc.psd_phi * error_factor
         
         return psd_as
     
@@ -755,26 +911,27 @@ class JolissaintAOModel:
         
         High-frequency turbulence aliased into low frequencies by the WFS.
         
-        Full implementation of Eq. (45):
+        Implementation of Eq. (45) using decorrelated replica assumption:
         
-        Φ_alias(f) = μ_WFS(f) * (fx²*fy²/f⁴) * Σ_n sinc²(Δt*f·v_n) *
-                     |Σ_{k,l≠0} [fx/(fy-l/Λ) + fy/(fx-k/Λ)] * (-1)^(k+l) *
-                      √[F_p(f-k/Λ,f-l/Λ) * Φ_n(f-k/Λ,f-l/Λ)]|²
+        Φ_alias(f) = μ_LF_eff(f) * (fx²*fy²/f⁴) * Σ_n sinc²(Δt*f·v_n) *
+                     Σ_{k,l≠0} [fx/(fy-l/Λ) + fy/(fx-k/Λ)]² *
+                     F_p(|f-(k/Λ,l/Λ)|) * Φ_n(|f-(k/Λ,l/Λ)|)
+        
+        where μ_LF_eff = μ_LF * μ_WFS (intersection of DM and WFS domains).
         
         With special handling for singularities at fx=0 [Eq. 47], fy=0 [Eq. 46],
         and (fx,fy)=(0,0) [Eq. 48].
         
-        Note: Aliasing is a WFS phenomenon, so domains are defined by the WFS
-        Nyquist frequency f_WFS = 1/(2Λ), not the DM cutoff f_AO.
+        Note: Cross-terms between different (k,l) replicas vanish due to
+        decorrelation assumption in deriving Eq. (45).
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         if not self.ao_config.include_aliasing:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
         # Check if we're on GPU - use vectorized path for better performance
-        is_gpu = backend.gpu
+        is_gpu = xp.__name__ == 'cupy'
         
         if is_gpu:
             return self._compute_aliasing_psd_vectorized()
@@ -783,128 +940,161 @@ class JolissaintAOModel:
     
     def _compute_aliasing_psd_vectorized(self) -> ArrayLike:
         """
-        Vectorized GPU-optimized aliasing PSD computation.
+        Vectorized GPU-optimized aliasing PSD computation with memory chunking.
         
-        Stacks all (k,l) terms into a 3D tensor for parallel processing.
-        Uses precomputed index arrays to avoid repeated allocations.
+        Processes (k,l) terms in batches to avoid GPU OOM on large grids.
+        Uses layer_cache for r0_sci and wind velocities.
         """
         xp = self._xp
         
         Lambda = self.ao_config.wfs_subaperture_size
         f_wfs = self.ao_config.f_wfs
         dt = self.ao_config.integration_time
+        is_square = self.ao_config.mask_geometry == 'square'
+        n_alias = 3
         
-        # Use precomputed index arrays
-        k_arr = self._alias_k_arr
-        l_arr = self._alias_l_arr
-        sign_arr = self._alias_sign_arr
+        # Memory-efficient chunking: process (k,l) pairs in batches
+        # Each batch creates (batch_size, n_pix, n_pix) arrays
+        # Batch size tuned for typical GPU memory (adjust if needed)
+        chunk_size = 12  # Process 12 (k,l) pairs at a time
         
-        psd_alias = xp.zeros_like(self.F, dtype=xp.float64)
+        # Build list of (k,l) pairs excluding (0,0)
+        kl_pairs = [(k, l) for k in range(-n_alias, n_alias + 1)
+                    for l in range(-n_alias, n_alias + 1) if not (k == 0 and l == 0)]
         
-        for layer in self.atmosphere.layers:
-            r0_sci = layer.r0 * (self.wavelength / self.atmosphere.wavelength_ref) ** (6/5)
-            vx, vy = layer.wind_velocity
-            
+        psd_alias = xp.zeros_like(self.grid.F, dtype=xp.float64)
+        
+        for lc in self.layer_cache:
             # Temporal averaging factor: sinc²(Δt * f·v)
-            f_dot_v = self.FX * vx + self.FY * vy
+            f_dot_v = self.grid.FX * lc.vx + self.grid.FY * lc.vy
             sinc2_temporal = xp.sinc(dt * f_dot_v) ** 2
             
-            # Vectorized computation: broadcast FX, FY to (n_terms, n_pix, n_pix)
-            FX_3d = self.FX[None, :, :]  # (1, n_pix, n_pix)
-            FY_3d = self.FY[None, :, :]
-            
-            # Aliased frequencies: (n_terms, n_pix, n_pix)
-            fx_alias = FX_3d - k_arr / Lambda
-            fy_alias = FY_3d - l_arr / Lambda
-            f_alias = xp.sqrt(fx_alias**2 + fy_alias**2)
-            
-            # HF mask: outside WFS Nyquist (geometry matches mask_geometry setting)
-            if self.ao_config.mask_geometry == 'circular':
-                is_hf = f_alias >= f_wfs
-            else:
-                is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
-            
-            # Von Karman PSD at aliased frequencies
+            # Von Karman coefficient (computed once per layer)
             L0_inv2 = 1.0 / self.atmosphere.L0**2 if self.atmosphere.L0 else 0
-            coeff = 0.023 * (r0_sci ** (-5/3))
-            if self.atmosphere.L0 is not None:
-                psd_alias_f = coeff * xp.power(f_alias**2 + L0_inv2, -11/6)
-            else:
-                f_alias_safe = xp.maximum(f_alias, 1e-12)
-                psd_alias_f = coeff * xp.power(f_alias_safe, -11/3)
+            coeff = 0.023 * (lc.r0_sci ** (-5/3))
             
-            # Piston filter using LUT (GPU-compatible)
-            Fp_alias = self._piston_lut(f_alias)
+            # Accumulate alias_sum over chunked (k,l) pairs (decorrelated replicas)
+            alias_sum = xp.zeros_like(self.grid.F, dtype=xp.float64)
             
-            # Amplitude: sqrt(F_p * Φ)
-            amplitude = xp.sqrt(xp.maximum(Fp_alias * psd_alias_f, 0.0))
-            
-            # Geometry factor with safe division
-            eps = 1e-12
-            safe_denom_x = xp.where(xp.abs(fy_alias) < eps, 
-                                     eps * xp.sign(fy_alias + eps), fy_alias)
-            safe_denom_y = xp.where(xp.abs(fx_alias) < eps,
-                                     eps * xp.sign(fx_alias + eps), fx_alias)
-            
-            term_x = FX_3d / safe_denom_x  # fx / (fy - l/Λ)
-            term_y = FY_3d / safe_denom_y  # fy / (fx - k/Λ)
-            geom_factor = term_x + term_y
-            
-            # Weighted contribution per (k,l): shape (n_terms, n_pix, n_pix)
-            contrib = is_hf.astype(xp.float64) * sign_arr * geom_factor * amplitude
-            
-            # Sum over all (k,l) terms
-            complex_sum = xp.sum(contrib, axis=0)  # (n_pix, n_pix)
+            for i in range(0, len(kl_pairs), chunk_size):
+                batch = kl_pairs[i:i + chunk_size]
+                batch_size = len(batch)
+                
+                # Build batch arrays: (batch_size, 1, 1) for broadcasting
+                k_batch = xp.array([kl[0] for kl in batch], dtype=xp.float64)[:, None, None]
+                l_batch = xp.array([kl[1] for kl in batch], dtype=xp.float64)[:, None, None]
+                
+                # Broadcast FX, FY to (batch_size, n_pix, n_pix)
+                FX_3d = self.grid.FX[None, :, :]
+                FY_3d = self.grid.FY[None, :, :]
+                
+                # Aliased frequencies
+                fx_alias = FX_3d - k_batch / Lambda
+                fy_alias = FY_3d - l_batch / Lambda
+                f_alias = xp.sqrt(fx_alias**2 + fy_alias**2)
+                
+                # HF mask
+                if is_square:
+                    is_hf = (xp.abs(fx_alias) >= f_wfs) | (xp.abs(fy_alias) >= f_wfs)
+                else:
+                    is_hf = f_alias >= f_wfs
+                
+                # Von Karman PSD at aliased frequencies
+                if self.atmosphere.L0 is not None:
+                    psd_alias_f = coeff * xp.power(f_alias**2 + L0_inv2, -11/6)
+                else:
+                    f_alias_safe = xp.maximum(f_alias, 1e-12)
+                    psd_alias_f = coeff * xp.power(f_alias_safe, -11/3)
+                
+                # Piston filter using LUT
+                Fp_alias = self._piston_lut(f_alias, xp=xp)
+                
+                # PSD term (no sqrt needed)
+                psd_term = xp.maximum(Fp_alias * psd_alias_f, 0.0)
+                
+                # Geometry factor with safe division
+                eps = 1e-12
+                safe_denom_x = xp.where(xp.abs(fy_alias) < eps,
+                                        eps * xp.sign(fy_alias + eps), fy_alias)
+                safe_denom_y = xp.where(xp.abs(fx_alias) < eps,
+                                        eps * xp.sign(fx_alias + eps), fx_alias)
+                
+                term_x = FX_3d / safe_denom_x
+                term_y = FY_3d / safe_denom_y
+                geom_factor = term_x + term_y
+                geom2 = geom_factor * geom_factor  # squared geometry term
+                
+                # PSD contribution for this batch
+                contrib = is_hf.astype(xp.float64) * geom2 * psd_term
+                
+                # Accumulate sum over batch
+                alias_sum = alias_sum + xp.sum(contrib, axis=0)
+                
+                # Free batch memory explicitly
+                del fx_alias, fy_alias, f_alias, is_hf, psd_alias_f, Fp_alias
+                del psd_term, geom_factor, geom2, contrib
             
             # Prefactor: fx²*fy²/f⁴
-            f4 = xp.maximum(self.F**4, 1e-40)
-            prefactor = (self.FX**2 * self.FY**2) / f4
+            f4 = xp.maximum(self.grid.F**4, 1e-40)
+            prefactor = (self.grid.FX**2 * self.grid.FY**2) / f4
             
             # Main PSD contribution
-            psd_layer = prefactor * sinc2_temporal * complex_sum**2
+            psd_layer = prefactor * sinc2_temporal * alias_sum
             
-            # Handle axis singularities - VECTORIZED for GPU using precomputed arrays
-            fx_zero = xp.abs(self.FX) < 1e-10
-            fy_zero = xp.abs(self.FY) < 1e-10
+            # Handle axis singularities (small arrays, no chunking needed)
+            fx_zero = xp.abs(self.grid.FX) < 1e-10
+            fy_zero = xp.abs(self.grid.FY) < 1e-10
             
             # fx=0 case using precomputed l_vals (l != 0): shape (6,)
             l_vals = self._alias_l_vals
-            FY_3d_l = self.FY[None, :, :]  # (1, n_pix, n_pix)
-            fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda  # (6, n_pix, n_pix)
+            FY_3d_l = self.grid.FY[None, :, :]
+            fy_al_3d = FY_3d_l - l_vals[:, None, None] / Lambda
             f_al_fx0 = xp.abs(fy_al_3d)
-            # HF check for singularity cases (1D - always radial since fx=0 or fy=0)
+            # At fx=0, HF check is |fy_alias| >= f_wfs (same for both geometries)
             is_hf_fx0 = f_al_fx0 >= f_wfs
             if self.atmosphere.L0 is not None:
                 psd_fx0_3d = coeff * xp.power(f_al_fx0**2 + L0_inv2, -11/6)
             else:
                 psd_fx0_3d = coeff * xp.power(xp.maximum(f_al_fx0, 1e-12), -11/3)
-            Fp_fx0_3d = self._piston_lut(f_al_fx0)
+            Fp_fx0_3d = self._piston_lut(f_al_fx0, xp=xp)
             psd_fx0 = xp.sum(is_hf_fx0.astype(xp.float64) * Fp_fx0_3d * psd_fx0_3d, axis=0) * sinc2_temporal
             
             # fy=0 case using precomputed k_vals (k != 0): shape (6,)
             k_vals = self._alias_k_vals
-            FX_3d_k = self.FX[None, :, :]
+            FX_3d_k = self.grid.FX[None, :, :]
             fx_al_3d = FX_3d_k - k_vals[:, None, None] / Lambda
             f_al_fy0 = xp.abs(fx_al_3d)
-            # HF check for singularity cases (1D - always radial since fx=0 or fy=0)
+            # At fy=0, HF check is |fx_alias| >= f_wfs (same for both geometries)
             is_hf_fy0 = f_al_fy0 >= f_wfs
             if self.atmosphere.L0 is not None:
                 psd_fy0_3d = coeff * xp.power(f_al_fy0**2 + L0_inv2, -11/6)
             else:
                 psd_fy0_3d = coeff * xp.power(xp.maximum(f_al_fy0, 1e-12), -11/3)
-            Fp_fy0_3d = self._piston_lut(f_al_fy0)
+            Fp_fy0_3d = self._piston_lut(f_al_fy0, xp=xp)
             psd_fy0 = xp.sum(is_hf_fy0.astype(xp.float64) * Fp_fy0_3d * psd_fy0_3d, axis=0) * sinc2_temporal
             
-            # (0,0) case using precomputed k_00, l_00 (k != 0 AND l != 0)
-            k_00 = self._alias_k_00
-            l_00 = self._alias_l_00
-            f_00_arr = xp.sqrt((k_00 / Lambda)**2 + (l_00 / Lambda)**2)
+            # (0,0) case: only axis replicas contribute
+            # Use existing precomputed arrays for k != 0 and l != 0
+            k_vals = self._alias_k_vals  # k != 0
+            l_vals = self._alias_l_vals  # l != 0
+            
+            # k-axis replicas: (|k|/Λ, 0)
+            f_k = xp.abs(k_vals) / Lambda
             if self.atmosphere.L0 is not None:
-                psd_00_arr = coeff * xp.power(f_00_arr**2 + L0_inv2, -11/6)
+                psd_k = coeff * xp.power(f_k**2 + L0_inv2, -11/6)
             else:
-                psd_00_arr = coeff * xp.power(f_00_arr, -11/3)
-            Fp_00_arr = self._piston_lut(f_00_arr)
-            psd_00 = xp.sum(Fp_00_arr * psd_00_arr)
+                psd_k = coeff * xp.power(xp.maximum(f_k, 1e-12), -11/3)
+            Fp_k = self._piston_lut(f_k, xp=xp)
+            
+            # l-axis replicas: (0, |l|/Λ)
+            f_l = xp.abs(l_vals) / Lambda
+            if self.atmosphere.L0 is not None:
+                psd_l = coeff * xp.power(f_l**2 + L0_inv2, -11/6)
+            else:
+                psd_l = coeff * xp.power(xp.maximum(f_l, 1e-12), -11/3)
+            Fp_l = self._piston_lut(f_l, xp=xp)
+            
+            psd_00 = xp.sum(Fp_k * psd_k) + xp.sum(Fp_l * psd_l)
             
             # Combine
             both_zero = fx_zero & fy_zero
@@ -912,35 +1102,39 @@ class JolissaintAOModel:
             psd_layer = xp.where(fx_zero & ~both_zero, psd_fx0, psd_layer)
             psd_layer = xp.where(fy_zero & ~both_zero, psd_fy0, psd_layer)
             
-            psd_alias = psd_alias + self.mu_WFS * psd_layer
+            # Aliasing is a LF residual term, but WFS-bounded.
+            # Use effective LF mask (intersection of DM and WFS domains).
+            mu_LF_eff = self.masks.mu_LF * self.masks.mu_WFS
+            psd_alias = psd_alias + mu_LF_eff * psd_layer
         
         return psd_alias
     
     def _compute_aliasing_psd_loop(self) -> ArrayLike:
         """
         Loop-based aliasing PSD computation (CPU-optimized with LUT).
+        
+        Uses precomputed layer cache (self.layer_cache) to avoid redundant PSD evaluation.
+        
+        Note: This method still accumulates (k,l) terms in memory. For GPU usage with large
+        arrays, use _compute_aliasing_psd_vectorized with chunking.
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         Lambda = self.ao_config.wfs_subaperture_size
         f_wfs = self.ao_config.f_wfs
         dt = self.ao_config.integration_time
         
-        psd_alias = xp.zeros_like(self.F, dtype=xp.float64)
+        psd_alias = xp.zeros_like(self.grid.F, dtype=xp.float64)
         n_alias = 3
         
-        for layer in self.atmosphere.layers:
-            r0_sci = layer.r0 * (self.wavelength / self.atmosphere.wavelength_ref) ** (6/5)
-            vx, vy = layer.wind_velocity
-            
+        for lc in self.layer_cache:
             # Temporal averaging factor: sinc²(Δt * f·v)
-            f_dot_v = self.FX * vx + self.FY * vy
+            f_dot_v = self.grid.FX * lc.vx + self.grid.FY * lc.vy
             sinc2_temporal = xp.sinc(dt * f_dot_v) ** 2
             
-            # Build the complex sum over (k,l) for Eq. (44)
-            # The term inside the absolute value squared
-            complex_sum = xp.zeros_like(self.F, dtype=xp.complex128)
+            # Sum over (k,l) replica contributions (decorrelated assumption)
+            # Each replica contributes: geom_factor² * Fp * Φ
+            alias_sum = xp.zeros_like(self.grid.F, dtype=xp.float64)
             
             for k in range(-n_alias, n_alias + 1):
                 for l in range(-n_alias, n_alias + 1):
@@ -948,8 +1142,8 @@ class JolissaintAOModel:
                         continue
                     
                     # Aliased frequency components
-                    fx_alias = self.FX - k / Lambda
-                    fy_alias = self.FY - l / Lambda
+                    fx_alias = self.grid.FX - k / Lambda
+                    fy_alias = self.grid.FY - l / Lambda
                     f_alias = xp.sqrt(fx_alias**2 + fy_alias**2)
                     
                     # Only spatial frequencies outside the WFS Nyquist alias into LF
@@ -961,21 +1155,18 @@ class JolissaintAOModel:
                     
                     # Turbulent PSD at aliased frequency
                     if self.atmosphere.L0 is not None:
-                        psd_alias_f = von_karman_psd(f_alias, r0_sci, self.atmosphere.L0)
+                        psd_alias_f = von_karman_psd(xp, f_alias, lc.r0_sci, self.atmosphere.L0)
                     else:
-                        psd_alias_f = kolmogorov_psd(f_alias, r0_sci)
+                        psd_alias_f = kolmogorov_psd(xp, f_alias, lc.r0_sci)
                     
                     # Piston filter at aliased frequency (use LUT for speed)
-                    Fp_alias = self._piston_lut(f_alias)
+                    Fp_alias = self._piston_lut(f_alias, xp=xp)
                     
-                    # Amplitude: sqrt(F_p * Φ)
-                    amplitude = xp.sqrt(xp.maximum(Fp_alias * psd_alias_f, 0.0))
-                    
-                    # Sign factor: (-1)^(k+l)
-                    sign = (-1) ** (k + l)
+                    # PSD term (no sqrt needed)
+                    psd_term = xp.maximum(Fp_alias * psd_alias_f, 0.0)
                     
                     # Geometry factor: fx/(fy - l/Λ) + fy/(fx - k/Λ)
-                    # Robust division based on actual denominator magnitude, not k/l values
+                    # Robust division based on actual denominator magnitude
                     eps = 1e-12
                     
                     denom_x = fy_alias  # denominator for fx/(...) term
@@ -983,79 +1174,95 @@ class JolissaintAOModel:
                     safe_denom_x = xp.where(xp.abs(denom_x) < eps, eps * xp.sign(denom_x + eps), denom_x)
                     safe_denom_y = xp.where(xp.abs(denom_y) < eps, eps * xp.sign(denom_y + eps), denom_y)
                     
-                    term_x = self.FX / safe_denom_x  # fx / (fy - l/Λ)
-                    term_y = self.FY / safe_denom_y  # fy / (fx - k/Λ)
+                    term_x = self.grid.FX / safe_denom_x  # fx / (fy - l/Λ)
+                    term_y = self.grid.FY / safe_denom_y  # fy / (fx - k/Λ)
                     
                     geom_factor = term_x + term_y
+                    geom2 = geom_factor * geom_factor  # squared geometry term
                     
-                    # Add to complex sum (only where HF)
-                    complex_sum = complex_sum + is_hf.astype(xp.float64) * sign * geom_factor * amplitude
+                    # Add PSD contribution (only where HF)
+                    alias_sum = alias_sum + is_hf.astype(xp.float64) * geom2 * psd_term
             
-            # Now compute the PSD from the squared magnitude of the sum
-            # Eq. (45): Φ_alias = μ_LF * (fx²fy²/f⁴) * sinc² * |sum|²
+            # Compute the PSD from the sum of replica contributions
+            # Eq. (45): Φ_alias = μ_LF_eff * (fx²fy²/f⁴) * sinc² * sum
             
             # Prefactor: fx²*fy²/f⁴
             # Handle singularities at axes
-            f4 = self.F**4
+            f4 = self.grid.F**4
             f4 = xp.maximum(f4, xp.float64(1e-40))
-            prefactor = (self.FX**2 * self.FY**2) / f4
+            prefactor = (self.grid.FX**2 * self.grid.FY**2) / f4
             
             # Main contribution from Eq. (45)
-            psd_layer = prefactor * sinc2_temporal * xp.abs(complex_sum)**2
+            psd_layer = prefactor * sinc2_temporal * alias_sum
             
             # Handle singularities using Eqs. (46-48)
             # These are limit cases that need special treatment
+            is_square = self.ao_config.mask_geometry == 'square'
             
             # Eq. (46): fx = 0 case (only l ≠ 0 terms contribute)
             # Φ_alias(0, fy) = μ_WFS * Σ_l≠0 F_p(0, fy-l/Λ) * Φ(0, fy-l/Λ)
-            fx_zero = xp.abs(self.FX) < 1e-10
-            psd_fx0 = xp.zeros_like(self.F)
+            fx_zero = xp.abs(self.grid.FX) < 1e-10
+            psd_fx0 = xp.zeros_like(self.grid.F)
             for l in range(-n_alias, n_alias + 1):
                 if l == 0:
                     continue
-                fy_alias = self.FY - l / Lambda
+                fy_alias = self.grid.FY - l / Lambda
                 f_alias = xp.abs(fy_alias)
-                # HF check (1D case - always radial since fx=0)
+                # HF check: at fx=0, aliased point is (0, fy-l/Λ)
+                # For square: |fy-l/Λ| >= f_wfs; for circular: same (radial = |fy| when fx=0)
                 is_hf_l = f_alias >= f_wfs
                 if self.atmosphere.L0 is not None:
-                    psd_l = von_karman_psd(f_alias, r0_sci, self.atmosphere.L0)
+                    psd_l = von_karman_psd(xp, f_alias, lc.r0_sci, self.atmosphere.L0)
                 else:
-                    psd_l = kolmogorov_psd(f_alias, r0_sci)
-                Fp_l = self._piston_lut(f_alias)
+                    psd_l = kolmogorov_psd(xp, f_alias, lc.r0_sci)
+                Fp_l = self._piston_lut(f_alias, xp=xp)
                 psd_fx0 = psd_fx0 + is_hf_l.astype(xp.float64) * Fp_l * psd_l * sinc2_temporal
             
             # Eq. (47): fy = 0 case (only k ≠ 0 terms contribute)
-            fy_zero = xp.abs(self.FY) < 1e-10
-            psd_fy0 = xp.zeros_like(self.F)
+            fy_zero = xp.abs(self.grid.FY) < 1e-10
+            psd_fy0 = xp.zeros_like(self.grid.F)
             for k in range(-n_alias, n_alias + 1):
                 if k == 0:
                     continue
-                fx_alias = self.FX - k / Lambda
+                fx_alias = self.grid.FX - k / Lambda
                 f_alias = xp.abs(fx_alias)
-                # HF check (1D case - always radial since fy=0)
+                # HF check: at fy=0, aliased point is (fx-k/Λ, 0)
+                # For square: |fx-k/Λ| >= f_wfs; for circular: same (radial = |fx| when fy=0)
                 is_hf_k = f_alias >= f_wfs
                 if self.atmosphere.L0 is not None:
-                    psd_k = von_karman_psd(f_alias, r0_sci, self.atmosphere.L0)
+                    psd_k = von_karman_psd(xp, f_alias, lc.r0_sci, self.atmosphere.L0)
                 else:
-                    psd_k = kolmogorov_psd(f_alias, r0_sci)
-                Fp_k = self._piston_lut(f_alias)
+                    psd_k = kolmogorov_psd(xp, f_alias, lc.r0_sci)
+                Fp_k = self._piston_lut(f_alias, xp=xp)
                 psd_fy0 = psd_fy0 + is_hf_k.astype(xp.float64) * Fp_k * psd_k * sinc2_temporal
             
             # Eq. (48): (fx, fy) = (0, 0) case
-            # Φ_alias(0,0) = μ_LF(0,0) * (fxfy/f⁴) * Σ_{k≠0} Σ_{l≠0} F_p(-k/Λ,-l/Λ) * Φ(-k/Λ,-l/Λ)
-            # This simplifies since fx=fy=0
+            # At (0,0), only axis replicas contribute: (k/Λ, 0) and (0, l/Λ)
             psd_00 = xp.float64(0.0)
+            
+            # k-axis replicas: (k/Λ, 0) for k != 0
             for k in range(-n_alias, n_alias + 1):
-                for l in range(-n_alias, n_alias + 1):
-                    if k == 0 or l == 0:
-                        continue
-                    f_alias_00 = math.sqrt((k/Lambda)**2 + (l/Lambda)**2)
-                    if self.atmosphere.L0 is not None:
-                        psd_kl = float(von_karman_psd(xp.array([f_alias_00]), r0_sci, self.atmosphere.L0)[0])
-                    else:
-                        psd_kl = float(kolmogorov_psd(xp.array([f_alias_00]), r0_sci)[0])
-                    Fp_kl = float(self._piston_lut(xp.array([f_alias_00]))[0])
-                    psd_00 = psd_00 + Fp_kl * psd_kl
+                if k == 0:
+                    continue
+                f_alias = abs(k) / Lambda
+                if self.atmosphere.L0 is not None:
+                    psd_k = float(von_karman_psd(xp, xp.array([f_alias]), lc.r0_sci, self.atmosphere.L0)[0])
+                else:
+                    psd_k = float(kolmogorov_psd(xp, xp.array([f_alias]), lc.r0_sci)[0])
+                Fp_k = float(self._piston_lut(xp.array([f_alias]), xp=xp)[0])
+                psd_00 += Fp_k * psd_k
+            
+            # l-axis replicas: (0, l/Λ) for l != 0
+            for l in range(-n_alias, n_alias + 1):
+                if l == 0:
+                    continue
+                f_alias = abs(l) / Lambda
+                if self.atmosphere.L0 is not None:
+                    psd_l = float(von_karman_psd(xp, xp.array([f_alias]), lc.r0_sci, self.atmosphere.L0)[0])
+                else:
+                    psd_l = float(kolmogorov_psd(xp, xp.array([f_alias]), lc.r0_sci)[0])
+                Fp_l = float(self._piston_lut(xp.array([f_alias]), xp=xp)[0])
+                psd_00 += Fp_l * psd_l
             
             # Combine: use special cases where applicable
             both_zero = fx_zero & fy_zero
@@ -1063,8 +1270,10 @@ class JolissaintAOModel:
             psd_layer = xp.where(fx_zero & ~both_zero, psd_fx0, psd_layer)
             psd_layer = xp.where(fy_zero & ~both_zero, psd_fy0, psd_layer)
             
-            # Aliasing PSD is defined over the WFS LF square, not the DM LF square
-            psd_alias = psd_alias + self.mu_WFS * psd_layer
+            # Aliasing is a LF residual term, but WFS-bounded.
+            # Use effective LF mask (intersection of DM and WFS domains).
+            mu_LF_eff = self.masks.mu_LF * self.masks.mu_WFS
+            psd_alias = psd_alias + mu_LF_eff * psd_layer
         
         return psd_alias
     
@@ -1083,11 +1292,10 @@ class JolissaintAOModel:
         not the DM domain. When wfs_subaperture_size != actuator_pitch,
         these domains differ.
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         if not self.ao_config.include_noise or self.ao_config.noise_variance == 0:
-            return xp.zeros_like(self.F)
+            return xp.zeros_like(self.grid.F)
         
         Lambda = self.ao_config.wfs_subaperture_size
         sigma_n2 = self.ao_config.noise_variance
@@ -1097,22 +1305,23 @@ class JolissaintAOModel:
         N = sigma_n2 / Lambda**2
         
         # sinc² terms with subaperture size
-        sinc_x = xp.sinc(Lambda * self.FX)
-        sinc_y = xp.sinc(Lambda * self.FY)
+        sinc_x = xp.sinc(Lambda * self.grid.FX)
+        sinc_y = xp.sinc(Lambda * self.grid.FY)
         sinc2 = sinc_x**2 * sinc_y**2
         
         # Avoid division by zero
-        f2 = self.F**2
+        f2 = self.grid.F**2
         f2 = xp.maximum(f2, xp.float64(1e-20))
         sinc2 = xp.maximum(sinc2, xp.float64(1e-20))
         
-        # Use WFS domain mask (mu_WFS), not DM domain (mu_LF)
-        # Per paper: "The WFS noise [...] is a random quantity, with a white
-        # spectrum bounded to the LF domain |fx|,|fy| < f_WFS"
-        psd_noise = self.mu_WFS * N / (4.0 * xp.pi**2 * f2 * sinc2)
+        # Use effective LF mask: intersection of DM-correctable and WFS-measurable domains
+        # Noise is a LF residual term, but WFS quantities are bounded to WFS domain.
+        # When f_wfs != f_ao, the correct support is the intersection.
+        mu_LF_eff = self.masks.mu_LF * self.masks.mu_WFS
+        psd_noise = mu_LF_eff * N / (4.0 * xp.pi**2 * f2 * sinc2)
         
         # Set DC to zero (no noise at f=0)
-        psd_noise = xp.where(self.F < 1e-10, xp.float64(0.0), psd_noise)
+        psd_noise = xp.where(self.grid.F < 1e-10, xp.float64(0.0), psd_noise)
         
         return psd_noise
     
@@ -1130,9 +1339,6 @@ class JolissaintAOModel:
         Returns:
             Total residual phase PSD
         """
-        backend = get_backend()
-        xp = backend.xp
-        
         # Fitting error (HF)
         psd_fit = self.compute_fitting_psd()
         
@@ -1169,8 +1375,7 @@ class JolissaintAOModel:
         Returns:
             Structure function D_φ(ρ) sampled on pupil grid
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         # Phase variance = integral of PSD
         # B_φ(0) = ∫∫ Φ(f) d²f
@@ -1209,8 +1414,7 @@ class JolissaintAOModel:
         Returns:
             AO-corrected OTF, centered
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         # OTF from structure function
         OTF_ao = xp.exp(-D_phi / 2.0)
@@ -1231,8 +1435,7 @@ class JolissaintAOModel:
         Returns:
             Telescope OTF (centered)
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         pupil = xp.asarray(pupil, dtype=xp.float64)
         
@@ -1252,7 +1455,8 @@ class JolissaintAOModel:
     def compute_long_exposure_psf(
         self,
         pupil: ArrayLike,
-        return_components: bool = False
+        return_components: bool = False,
+        include_lwe: bool = True,
     ) -> Union[ArrayLike, Dict[str, ArrayLike]]:
         """
         Compute long-exposure AO-corrected PSF.
@@ -1261,17 +1465,24 @@ class JolissaintAOModel:
         
         PSF = IFT(OTF_ao × OTF_tsc)
         
+        If LWE is configured and include_lwe=True, the PSF is averaged over
+        multiple realizations with different LWE phase screens to simulate
+        the effect of quasi-static aberrations.
+        
         Args:
             pupil: 2D pupil amplitude array
             return_components: If True, return dict with intermediate results
+            include_lwe: If True and lwe_config is set, include Low Wind Effect
         
         Returns:
             If return_components=False: PSF array (normalized to sum=1)
             If return_components=True: Dict with 'psf', 'otf_total', 'otf_ao',
                                        'otf_tsc', 'structure_function', 'psd_total'
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
+        
+        # Convert pupil to backend array (CPU or GPU)
+        pupil = xp.asarray(pupil, dtype=xp.float64)
         
         # Compute residual phase PSD
         psd_total = self.compute_total_residual_psd()
@@ -1285,18 +1496,26 @@ class JolissaintAOModel:
         # Telescope OTF
         OTF_tsc = self.compute_telescope_otf(pupil)
         
-        # Total system OTF
+        # Total system OTF (before LWE)
         OTF_total = OTF_ao * OTF_tsc
         
-        # PSF via inverse FFT
-        # Need to ifftshift before ifft2 since OTF is centered
-        PSF = xp.abs(xp.fft.ifft2(xp.fft.ifftshift(OTF_total)))
-        
-        # Shift to center
-        PSF = xp.fft.fftshift(PSF)
-        
-        # Normalize to sum = 1 (energy conservation)
-        PSF = PSF / xp.sum(PSF)
+        # Apply LWE if configured
+        if include_lwe and self.lwe_config is not None:
+            PSF = self._compute_psf_with_lwe(pupil, OTF_total)
+        else:
+            # PSF via inverse FFT
+            # Need to ifftshift before ifft2 since OTF is centered
+            # Use real part (PSF should be real for symmetric OTF) and clamp negatives
+            PSF = xp.real(xp.fft.ifft2(xp.fft.ifftshift(OTF_total)))
+            
+            # Shift to center
+            PSF = xp.fft.fftshift(PSF)
+            
+            # Clamp any numerical negatives (should be negligible if OTF is physical)
+            PSF = xp.maximum(PSF, 0.0)
+            
+            # Normalize to sum = 1 (energy conservation)
+            PSF = PSF / xp.sum(PSF)
         
         if return_components:
             return {
@@ -1309,6 +1528,104 @@ class JolissaintAOModel:
             }
         
         return PSF
+    
+    def _compute_psf_with_lwe(self, pupil: ArrayLike, OTF_base: ArrayLike) -> ArrayLike:
+        """
+        Compute long-exposure PSF including Low Wind Effect.
+        
+        The LWE is applied by averaging over multiple realizations:
+        1. Generate n_realizations LWE phase screens
+        2. For each screen, compute OTF_lwe and multiply with base OTF
+        3. Average the resulting PSFs
+        
+        This simulates the long-exposure effect of quasi-static aberrations
+        that vary slowly compared to the AO correction loop but faster than
+        the exposure time.
+        
+        Args:
+            pupil: 2D pupil amplitude array
+            OTF_base: Base OTF (OTF_ao × OTF_tsc) before LWE
+        
+        Returns:
+            PSF averaged over LWE realizations
+        """
+        xp = self._xp
+        
+        # Initialize LWE model if needed
+        if self._lwe_model is None:
+            self._lwe_model = LowWindEffect(
+                pupil=pupil,
+                piston_rms_rad=self.lwe_config.piston_rms_rad,
+                tilt_rms_rad=self.lwe_config.tilt_rms_rad,
+                ar_coeff=self.lwe_config.ar_coeff,
+            )
+        
+        # Generate LWE phase screens
+        n_realizations = self.lwe_config.n_realizations
+        seed = self.lwe_config.seed
+        lwe_phases = self._lwe_model.generate(n_realizations, seed=seed)
+        
+        # Ensure LWE phases are on correct backend
+        lwe_phases = xp.asarray(lwe_phases)
+        
+        # Accumulate PSFs over realizations
+        PSF_avg = xp.zeros((self.n_pix, self.n_pix), dtype=xp.float64)
+        
+        for i in range(n_realizations):
+            lwe_phase = lwe_phases[i]
+            
+            # Compute LWE OTF degradation
+            # The OTF degradation from a phase error is given by:
+            #   OTF_lwe(f) = <exp(i*[phi(r) - phi(r+f)])>
+            # For uncorrelated phase errors, this is exp(-D_phi/2)
+            # where D_phi is the structure function.
+            #
+            # We compute this as the autocorrelation of exp(i*phi) over the pupil,
+            # then divide by the pupil autocorrelation (telescope OTF) to get
+            # just the phase degradation factor.
+            #
+            # OTF_lwe = autocorr(pupil * exp(i*phi)) / autocorr(pupil)
+            #         = FT⁻¹(|FT(pupil * exp(i*phi))|²) / FT⁻¹(|FT(pupil)|²)
+            
+            pupil_with_lwe = pupil * xp.exp(1j * lwe_phase)
+            
+            # Autocorrelation of aberrated pupil
+            Pupil_f_lwe = xp.fft.fft2(xp.fft.ifftshift(pupil_with_lwe))
+            autocorr_lwe = xp.fft.fftshift(xp.fft.ifft2(xp.abs(Pupil_f_lwe)**2))
+            
+            # Autocorrelation of reference pupil (telescope OTF, not normalized)
+            Pupil_f_ref = xp.fft.fft2(xp.fft.ifftshift(pupil))
+            autocorr_ref = xp.fft.fftshift(xp.fft.ifft2(xp.abs(Pupil_f_ref)**2))
+            
+            # LWE OTF is the ratio (avoid division by zero)
+            # This extracts just the phase degradation, independent of telescope OTF
+            epsilon = 1e-10 * xp.max(xp.abs(autocorr_ref))
+            OTF_lwe = xp.real(autocorr_lwe) / (xp.real(autocorr_ref) + epsilon)
+            
+            # Clip to valid range (should be between 0 and 1 for small aberrations)
+            OTF_lwe = xp.clip(OTF_lwe, 0.0, 1.0)
+            
+            # Total OTF for this realization (OTF_base already includes telescope OTF)
+            OTF_total = OTF_base * OTF_lwe
+            
+            # Compute PSF
+            PSF_i = xp.real(xp.fft.ifft2(xp.fft.ifftshift(OTF_total)))
+            PSF_i = xp.fft.fftshift(PSF_i)
+            PSF_i = xp.maximum(PSF_i, 0.0)
+            
+            # Normalize this realization
+            PSF_i = PSF_i / xp.sum(PSF_i)
+            
+            # Accumulate
+            PSF_avg += PSF_i
+        
+        # Average over realizations
+        PSF_avg = PSF_avg / n_realizations
+        
+        # Final normalization (should already be ~1, but ensure it)
+        PSF_avg = PSF_avg / xp.sum(PSF_avg)
+        
+        return PSF_avg
     
     def compute_strehl_ratio(self, pupil: ArrayLike) -> float:
         """
@@ -1324,8 +1641,7 @@ class JolissaintAOModel:
         Returns:
             Strehl ratio (0 to 1)
         """
-        backend = get_backend()
-        xp = backend.xp
+        xp = self._xp
         
         # Residual phase variance = integral of PSD
         psd_total = self.compute_total_residual_psd()
@@ -1336,66 +1652,37 @@ class JolissaintAOModel:
         
         return min(1.0, max(0.0, strehl))
     
-    def get_error_breakdown(self) -> Dict[str, float]:
+    def compute_psd_terms(self) -> Dict[str, ArrayLike]:
         """
-        Get breakdown of error contributions.
+        Compute all PSD error terms without mutating config.
         
         Returns:
-            Dict with variance contributions from each error source.
+            Dict mapping error source names to PSD arrays.
         """
-        backend = get_backend()
-        xp = backend.xp
+        terms = {}
+        terms['fitting'] = self.compute_fitting_psd()
+        terms['anisoplanatism'] = self.compute_anisoplanatism_psd()
+        terms['servo_lag'] = self.compute_servo_lag_psd()
+        terms['aliasing'] = self.compute_aliasing_psd()
+        terms['noise'] = self.compute_noise_psd()
+        return terms
+    
+    def get_error_breakdown(self) -> Dict[str, float]:
+        """
+        Get breakdown of error contributions as variances.
         
-        # Store current settings
-        orig_settings = {
-            'fitting': self.ao_config.include_fitting,
-            'aniso': self.ao_config.include_anisoplanatism,
-            'servo': self.ao_config.include_servo_lag,
-            'alias': self.ao_config.include_aliasing,
-            'noise': self.ao_config.include_noise,
-        }
+        Returns:
+            Dict with variance contributions from each error source (rad²).
+        """
+        xp = self._xp
         
+        # Compute all terms (respects include_* flags in each compute method)
+        psd_terms = self.compute_psd_terms()
+        
+        # Integrate each PSD to get variance
         errors = {}
-        
-        # Fitting error
-        self.ao_config.include_fitting = True
-        self.ao_config.include_anisoplanatism = False
-        self.ao_config.include_servo_lag = False
-        self.ao_config.include_aliasing = False
-        self.ao_config.include_noise = False
-        psd = self.compute_fitting_psd()
-        errors['fitting'] = float(xp.sum(psd) * self.dA)
-        
-        # Anisoplanatism
-        self.ao_config.include_fitting = False
-        self.ao_config.include_anisoplanatism = True
-        psd = self.compute_anisoplanatism_psd()
-        errors['anisoplanatism'] = float(xp.sum(psd) * self.dA)
-        
-        # Servo-lag
-        self.ao_config.include_anisoplanatism = False
-        self.ao_config.include_servo_lag = True
-        psd = self.compute_servo_lag_psd()
-        errors['servo_lag'] = float(xp.sum(psd) * self.dA)
-        
-        # Aliasing
-        self.ao_config.include_servo_lag = False
-        self.ao_config.include_aliasing = True
-        psd = self.compute_aliasing_psd()
-        errors['aliasing'] = float(xp.sum(psd) * self.dA)
-        
-        # Noise
-        self.ao_config.include_aliasing = False
-        self.ao_config.include_noise = True
-        psd = self.compute_noise_psd()
-        errors['noise'] = float(xp.sum(psd) * self.dA)
-        
-        # Restore settings
-        self.ao_config.include_fitting = orig_settings['fitting']
-        self.ao_config.include_anisoplanatism = orig_settings['aniso']
-        self.ao_config.include_servo_lag = orig_settings['servo']
-        self.ao_config.include_aliasing = orig_settings['alias']
-        self.ao_config.include_noise = orig_settings['noise']
+        for name, psd in psd_terms.items():
+            errors[name] = float(xp.sum(psd) * self.dA)
         
         # Total variance
         errors['total'] = sum(errors.values())
@@ -1404,6 +1691,199 @@ class JolissaintAOModel:
         errors['rms_rad'] = math.sqrt(errors['total'])
         
         return errors
+    
+    # =========================================================================
+    # Monte Carlo Phase Sampling (Unified Interface)
+    # =========================================================================
+    
+    def generate_phase_screens(
+        self,
+        n_screens: int,
+        pupil: Optional[ArrayLike] = None,
+        seed: Optional[int] = None,
+        include_lwe: bool = False,
+    ) -> ArrayLike:
+        """
+        Generate phase screens by Monte Carlo sampling from the analytical PSD.
+        
+        This provides compatibility with the unified PhaseGeneratorBase interface.
+        The method samples from the total residual PSD to produce phase screens
+        with the correct spatial correlation structure.
+        
+        Args:
+            n_screens: Number of phase screens to generate
+            pupil: Optional pupil mask for piston removal and masking
+            seed: Random seed for reproducibility
+            include_lwe: If True, add LWE phase to each screen
+            
+        Returns:
+            Phase screens array (n_screens, n_pix, n_pix) in radians
+        """
+        xp = self._xp
+        n_pix = self.n_pix
+        
+        # Set random seed
+        if seed is not None:
+            if hasattr(xp.random, 'seed'):
+                xp.random.seed(seed)
+        
+        # Get total residual PSD
+        psd_total = self.compute_total_residual_psd()
+        
+        # Compute amplitude for phase generation
+        # A = sqrt(N^4 × PSD × df²) for real output from complex noise
+        amplitude = xp.sqrt((n_pix ** 4) * psd_total * self.dA).astype(xp.float64)
+        
+        # Zero DC to ensure zero mean phase
+        amplitude.flat[0] = 0.0
+        
+        # Generate complex white noise
+        noise_real = xp.random.randn(n_screens, n_pix, n_pix).astype(xp.float64)
+        noise_imag = xp.random.randn(n_screens, n_pix, n_pix).astype(xp.float64)
+        W = noise_real + 1j * noise_imag
+        
+        # Apply PSD coloring
+        Phi_f = W * amplitude[None, :, :]
+        
+        # Transform to spatial domain (take real part)
+        phi = xp.real(xp.fft.ifft2(Phi_f)).astype(xp.float64)
+        
+        # Remove piston over pupil if provided
+        if pupil is not None:
+            pupil = xp.asarray(pupil, dtype=xp.float64)
+            pupil_sum = xp.sum(pupil)
+            if pupil_sum > 0:
+                mean_phi = xp.sum(phi * pupil[None, :, :], axis=(1, 2)) / pupil_sum
+                phi = (phi - mean_phi[:, None, None]) * pupil[None, :, :]
+        
+        # Add LWE if requested
+        if include_lwe and self.lwe_config is not None:
+            # Initialize LWE model if needed
+            if self._lwe_model is None and pupil is not None:
+                self._lwe_model = LowWindEffect(
+                    pupil=pupil,
+                    piston_rms_rad=self.lwe_config.piston_rms_rad,
+                    tilt_rms_rad=self.lwe_config.tilt_rms_rad,
+                    ar_coeff=self.lwe_config.ar_coeff,
+                )
+            
+            if self._lwe_model is not None:
+                lwe_seed = self.lwe_config.seed
+                if seed is not None:
+                    lwe_seed = seed + 1000  # Offset to avoid correlation
+                lwe_phases = self._lwe_model.generate(n_screens, seed=lwe_seed)
+                phi = phi + lwe_phases
+        
+        return phi
+    
+    def generate_phase_screens_with_lwe(
+        self,
+        n_screens: int,
+        pupil: ArrayLike,
+        seed: Optional[int] = None,
+    ) -> Tuple[ArrayLike, ArrayLike, ArrayLike]:
+        """
+        Generate phase screens with separate AO residual and LWE components.
+        
+        Args:
+            n_screens: Number of phase screens
+            pupil: Pupil mask (required for LWE)
+            seed: Random seed
+            
+        Returns:
+            Tuple of:
+            - phase_ao: (n_screens, n_pix, n_pix) AO residual phase
+            - phase_lwe: (n_screens, n_pix, n_pix) LWE phase
+            - phase_total: (n_screens, n_pix, n_pix) combined phase
+        """
+        xp = self._xp
+        
+        # Generate AO residual phases
+        phase_ao = self.generate_phase_screens(
+            n_screens, pupil, seed, include_lwe=False
+        )
+        
+        # Generate LWE phases
+        if self.lwe_config is None:
+            phase_lwe = xp.zeros_like(phase_ao)
+        else:
+            if self._lwe_model is None:
+                self._lwe_model = LowWindEffect(
+                    pupil=pupil,
+                    piston_rms_rad=self.lwe_config.piston_rms_rad,
+                    tilt_rms_rad=self.lwe_config.tilt_rms_rad,
+                    ar_coeff=self.lwe_config.ar_coeff,
+                )
+            lwe_seed = self.lwe_config.seed
+            if seed is not None:
+                lwe_seed = seed + 1000
+            phase_lwe = self._lwe_model.generate(n_screens, seed=lwe_seed)
+            # Ensure LWE phases are on same backend
+            phase_lwe = xp.asarray(phase_lwe)
+        
+        # Combine
+        phase_total = phase_ao + phase_lwe
+        
+        return phase_ao, phase_lwe, phase_total
+    
+    @property
+    def rms_expected(self) -> float:
+        """Expected RMS of residual phase (radians)."""
+        return self.get_error_breakdown()['rms_rad']
+    
+    @property
+    def pixel_size(self) -> float:
+        """Pixel size in pupil plane (meters) - for interface compatibility."""
+        return self.pupil_pixel_size
+    
+    # =========================================================================
+    # Alternative constructors
+    # =========================================================================
+    
+    @classmethod
+    def from_pupil(
+        cls,
+        pupil: 'Pupil',
+        atmosphere: AtmosphereProfile,
+        ao_config: AOSystemConfig,
+    ) -> 'JolissaintAOModel':
+        """
+        Create model from a Pupil object.
+        
+        This is the preferred way to initialize the model as it ensures
+        consistent physical parameters between the pupil and the model.
+        
+        Args:
+            pupil: Pupil object with amplitude map and physical parameters
+            atmosphere: Atmospheric turbulence profile
+            ao_config: AO system configuration
+        
+        Returns:
+            JolissaintAOModel instance
+        
+        Example:
+            from nebraa.physics.pupil import Pupil
+            
+            # Create a VLT pupil
+            pupil = Pupil.from_vlt(
+                n_pix=256, wavelength=2.2e-6, pixel_scale=13e-3/206265
+            )
+            
+            # Create model
+            model = JolissaintAOModel.from_pupil(pupil, atmosphere, ao_config)
+            
+            # Compute PSF (pass pupil.amplitude)
+            psf = model.compute_long_exposure_psf(pupil.amplitude)
+        """
+        return cls(
+            n_pix=pupil.n_pix,
+            telescope_diameter=pupil.diameter,
+            obstruction_diameter=pupil.obstruction_diameter,
+            wavelength=pupil.wavelength,
+            pixel_scale=pupil.pixel_scale,
+            atmosphere=atmosphere,
+            ao_config=ao_config,
+        )
 
 
 # =============================================================================

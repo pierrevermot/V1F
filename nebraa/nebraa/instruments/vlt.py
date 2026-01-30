@@ -17,6 +17,7 @@ from typing import Optional, Tuple, List
 from ..config import InstrumentConfig
 from ..utils.compute import get_backend
 from ..physics import zernike, kolmogorov, optics, noise
+from ..physics.low_wind_effect import LowWindEffect, LowWindEffectConfig
 from . import Instrument, register_instrument
 
 
@@ -220,172 +221,6 @@ def vlt_spider_segments(
 # Low Wind Effect Model
 # =============================================================================
 
-class LowWindEffect:
-    """
-    General Low Wind Effect (LWE) model.
-    
-    Automatically detects disconnected regions ("islands" or "petals") in a
-    pupil mask and applies differential piston, tip, and tilt to each region.
-    
-    This is a general implementation that works with any pupil geometry
-    (VLT, ELT, segmented mirrors, etc.) without requiring manual sector
-    definition.
-    """
-    
-    def __init__(
-        self,
-        pupil: np.ndarray,
-        piston_rms_rad: float = 0.5,
-        tilt_rms_rad: float = 0.3,
-        ar_coeff: float = 0.95,
-    ):
-        """
-        Initialize LWE model from a pupil mask.
-        
-        Args:
-            pupil: 2D pupil amplitude mask (values > 0.5 are considered part of pupil)
-            piston_rms_rad: RMS of differential piston in radians
-            tilt_rms_rad: RMS of differential tip/tilt in radians
-            ar_coeff: AR(1) coefficient for temporal correlation (not yet used)
-        """
-        backend = get_backend()
-        xp = backend.xp
-        
-        self.piston_rms = piston_rms_rad
-        self.tilt_rms = tilt_rms_rad
-        self.ar_coeff = ar_coeff
-        
-        # Convert pupil to numpy for scipy labeling
-        pupil_np = backend.ensure_local(pupil)
-        self.n_pix = pupil_np.shape[0]
-        
-        # Detect islands using connected component labeling
-        self.island_masks, self.n_islands = self._detect_islands(pupil_np)
-        
-        # Build normalized tip/tilt coordinates for each island
-        self._build_tilt_coords()
-    
-    def _detect_islands(self, pupil: np.ndarray):
-        """
-        Detect disconnected regions in the pupil using connected component labeling.
-        
-        Args:
-            pupil: 2D pupil mask
-            
-        Returns:
-            island_masks: (n_islands, n_pix, n_pix) array of island masks
-            n_islands: number of detected islands
-        """
-        from scipy import ndimage
-        
-        # Binarize pupil - use high threshold to detect islands separated by 
-        # any obstruction (spiders, gaps, etc.) even if poorly sampled
-        binary_pupil = (pupil > 0.99).astype(np.int32)
-        
-        # Label connected components
-        labeled, n_islands = ndimage.label(binary_pupil)
-        
-        # Create individual masks for each island
-        island_masks = np.zeros((n_islands, self.n_pix, self.n_pix), dtype=np.float32)
-        for i in range(n_islands):
-            island_masks[i] = (labeled == (i + 1)).astype(np.float32)
-        
-        return island_masks, n_islands
-    
-    def _build_tilt_coords(self):
-        """Build normalized tip/tilt coordinate grids for each island."""
-        backend = get_backend()
-        xp = backend.xp
-        
-        # Global coordinate grid
-        c = (self.n_pix - 1) / 2.0
-        idx = np.arange(self.n_pix, dtype=np.float32)
-        X, Y = np.meshgrid(idx, idx)
-        
-        # For each island, compute normalized coordinates relative to island center
-        self.X_norm = np.zeros((self.n_islands, self.n_pix, self.n_pix), dtype=np.float32)
-        self.Y_norm = np.zeros((self.n_islands, self.n_pix, self.n_pix), dtype=np.float32)
-        
-        for i in range(self.n_islands):
-            mask = self.island_masks[i]
-            
-            # Find island centroid
-            total = mask.sum()
-            if total > 0:
-                cx = (X * mask).sum() / total
-                cy = (Y * mask).sum() / total
-                
-                # Find island extent for normalization
-                island_pixels = np.where(mask > 0.5)
-                if len(island_pixels[0]) > 0:
-                    extent = max(
-                        island_pixels[0].max() - island_pixels[0].min(),
-                        island_pixels[1].max() - island_pixels[1].min()
-                    )
-                    extent = max(extent, 1)  # Avoid division by zero
-                    
-                    # Normalized coordinates (centered on island, scaled by extent)
-                    self.X_norm[i] = (X - cx) / (extent / 2)
-                    self.Y_norm[i] = (Y - cy) / (extent / 2)
-        
-        # Convert to backend array type
-        self.island_masks = xp.asarray(self.island_masks)
-        self.X_norm = xp.asarray(self.X_norm)
-        self.Y_norm = xp.asarray(self.Y_norm)
-    
-    def generate(self, n_screens: int, seed: Optional[int] = None):
-        """
-        Generate LWE phase screens.
-        
-        Args:
-            n_screens: Number of phase screens to generate
-            seed: Random seed for reproducibility
-            
-        Returns:
-            phase: (n_screens, n_pix, n_pix) array of phase screens in radians
-        """
-        backend = get_backend()
-        xp = backend.xp
-        
-        if seed is not None:
-            xp.random.seed(seed)
-        
-        # Random differential coefficients for each island
-        # Note: We make these differential (zero mean across islands)
-        pistons = xp.random.randn(self.n_islands, n_screens).astype(xp.float32) * self.piston_rms
-        tips_x = xp.random.randn(self.n_islands, n_screens).astype(xp.float32) * self.tilt_rms
-        tips_y = xp.random.randn(self.n_islands, n_screens).astype(xp.float32) * self.tilt_rms
-        
-        # Remove mean to make truly differential
-        pistons = pistons - pistons.mean(axis=0, keepdims=True)
-        tips_x = tips_x - tips_x.mean(axis=0, keepdims=True)
-        tips_y = tips_y - tips_y.mean(axis=0, keepdims=True)
-        
-        # Build phase screens
-        phase = xp.zeros((n_screens, self.n_pix, self.n_pix), dtype=xp.float32)
-        
-        for i in range(self.n_islands):
-            mask = self.island_masks[i]
-            x_norm = self.X_norm[i]
-            y_norm = self.Y_norm[i]
-            
-            # Add piston
-            phase += pistons[i, :, None, None] * mask[None, :, :]
-            
-            # Add tip (X tilt)
-            phase += tips_x[i, :, None, None] * x_norm[None, :, :] * mask[None, :, :]
-            
-            # Add tilt (Y tilt)
-            phase += tips_y[i, :, None, None] * y_norm[None, :, :] * mask[None, :, :]
-        
-        return phase
-    
-    @property 
-    def masks(self):
-        """Return island masks for compatibility."""
-        return self.island_masks
-
-
 # Keep old class for backwards compatibility
 class VLTLowWindEffect(LowWindEffect):
     """
@@ -553,7 +388,7 @@ class VLTInstrument(Instrument):
         
         # LWE
         if include_lwe and self._lwe is not None:
-            lwe_phase = self._lwe.generate(1, self.pupil)
+            lwe_phase = self._lwe.generate(n_screens=1)
             total_phase = total_phase + lwe_phase[0]
         
         # Compute PSF
@@ -622,7 +457,7 @@ class VLTInstrument(Instrument):
         
         # LWE
         if include_lwe and self._lwe is not None:
-            lwe_phase = self._lwe.generate(n, self.pupil)
+            lwe_phase = self._lwe.generate(n_screens=n)
             total_phase = total_phase + lwe_phase
         
         # Compute PSFs
